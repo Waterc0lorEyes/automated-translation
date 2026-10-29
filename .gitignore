@@ -1,0 +1,7 @@
+/target
+/automated-translation
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env

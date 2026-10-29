@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{{ title_history }}{% endblock %}
+{% block content %}
+<div class="card">
+    <h1>{{ h1_history }}</h1>
+    {% if translations | length > 0 %}
+    <table>
+        <thead>
+            <tr>
+                <th>{{ th_filename }}</th>
+                <th>{{ th_lang }}</th>
+                <th>{{ time }}</th>
+                <th>{{ th_actions }}</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for t in translations %}
+            <tr>
+                <td>{{ t.filename }}</td>
+                <td>{{ t.source_lang }} -> {{ t.target_lang }}</td>
+                <td>{{ t.created_at }}</td>
+                <td><a href="/result/{{ t.id }}">{{ th_view }}</a></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty">{{ no_translations }}</p>
+    {% endif %}
+</div>
+{% endblock %}

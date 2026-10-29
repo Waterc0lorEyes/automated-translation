@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ title_login }}{% endblock %}
+{% block content %}
+<div class="auth-page">
+    <div class="card auth-card">
+        <h1>{{ h1_login }}</h1>
+        {% if error == "invalid" %}
+        <div class="alert alert-error">{{ auth_error_invalid }}</div>
+        {% endif %}
+        <form method="post">
+            <div class="form-group">
+                <label>{{ label_username }}</label>
+                <input type="text" name="username" required autofocus>
+            </div>
+            <div class="form-group">
+                <label>{{ label_password }}</label>
+                <input type="password" name="password" required>
+            </div>
+            <button type="submit" class="btn btn-primary btn-full">{{ btn_login }}</button>
+        </form>
+        <p class="auth-link">{{ auth_no_account }}<a href="/register">{{ auth_link }}</a></p>
+    </div>
+</div>
+{% endblock %}

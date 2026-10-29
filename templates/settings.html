@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ title_settings }}{% endblock %}
+{% block content %}
+<div class="card auth-card">
+    <h1>{{ h1_settings }}</h1>
+    {% if updated %}
+    <div class="alert alert-success">{{ settings_saved }}</div>
+    {% endif %}
+    <form method="post">
+        <div class="form-group">
+            <label>{{ label_api_key }}</label>
+            <input type="password" name="api_key" placeholder="sk-..." value="{{ api_key }}" required>
+            {% if api_key_masked %}
+            <p class="hint">{{ settings_current }}{{ api_key_masked }}</p>
+            {% endif %}
+        </div>
+        <button type="submit" class="btn btn-primary btn-full">{{ btn_save }}</button>
+    </form>
+    <p class="auth-link">
+        <a href="https://platform.deepseek.com/" target="_blank">{{ settings_get_key }}</a>
+    </p>
+</div>
+{% endblock %}
