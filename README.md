@@ -366,7 +366,7 @@ CSV 针对 Excel 做了处理：UTF-8 BOM、CRLF 换行、字段含逗号/引号
 ## 测试
 
 ```bash
-cargo test        # 69 个单元测试
+cargo test        # 70 个单元测试
 cargo clippy      # 0 warning
 
 cd frontend

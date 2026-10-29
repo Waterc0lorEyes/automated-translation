@@ -125,7 +125,9 @@ Rust (Axum)
 ## 4. 认证与安全
 
 - Cookie：`HttpOnly` + `SameSite=Lax` + `Path=/` + `Max-Age=7d`（https 下加 `Secure`）。
-- 写操作额外做 **Origin 校验**：`Origin` 的 authority 必须等于 `Host`，否则 `403 bad_origin`。
+- 写操作额外做 **Origin 校验**：`Origin` 与 `Host` 的**主机名**必须一致，否则 `403 bad_origin`。
+  只比主机名、不比端口，因为 nginx 默认的 `proxy_set_header Host $host` 会丢掉端口；
+  严格要求端口一致会把正常请求误杀（这个坑实测过）。
   `SameSite=Lax` 已挡住跨站 POST，这层是防止未来改 Cookie 策略时裸奔。
 - 密码 Argon2；SQL 全参数绑定；下载文件名 RFC 5987 编码。
 - 前端不用 `innerHTML` 渲染译文（Vue 默认转义）。
@@ -196,7 +198,7 @@ ssh host 'cd ~/automated-translation && mv -f automated-translation.new automate
 ## 8. 测试
 
 ```bash
-cargo test            # 69 passed（Rust：解析/翻译协议/导出/会话/文件名）
+cargo test            # 70 passed（Rust：解析/翻译协议/导出/会话/文件名）
 cargo clippy          # 0 warning
 cd frontend
 npm run typecheck     # 0 error

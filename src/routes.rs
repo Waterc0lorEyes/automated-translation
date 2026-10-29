@@ -72,7 +72,18 @@ pub fn router() -> Router<Arc<AppState>> {
         .fallback_service(ServeDir::new("static").fallback(get(spa_index)))
 }
 
-/// 写操作的 Origin 校验：Origin 的 authority 必须和 Host 一致。
+/// 取 authority 里的主机名，忽略端口；兼容 IPv6 的 `[::1]:8080`。
+fn hostname(authority: &str) -> &str {
+    let value = authority.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &value[..end + 2];
+        }
+    }
+    value.split(':').next().unwrap_or(value)
+}
+
+/// 写操作的 Origin 校验：Origin 和 Host 的主机名必须一致。
 pub async fn origin_guard(req: Request, next: Next) -> Response {
     let mutating = matches!(
         *req.method(),
@@ -93,8 +104,10 @@ pub async fn origin_guard(req: Request, next: Next) -> Response {
             .to_owned();
 
         if let Some(origin) = origin {
-            let origin_host = origin.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
-            if !host.is_empty() && !origin_host.eq_ignore_ascii_case(&host) {
+            let origin_authority = origin.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+            // 只比较主机名：反代常把 Host 的端口去掉（proxy_set_header Host $host），
+            // 严格要求端口一致会误杀正常请求。跨站请求的 Host 本来就不是我们的域名。
+            if !host.is_empty() && !hostname(origin_authority).eq_ignore_ascii_case(hostname(&host)) {
                 tracing::warn!("拒绝跨站写请求: origin={} host={}", origin, host);
                 return api_error(StatusCode::FORBIDDEN, "bad_origin");
             }
@@ -1084,6 +1097,15 @@ mod tests {
         assert_eq!(mask_key("short"), "****");
         assert_eq!(mask_key("sk-1234567890"), "sk-1****7890");
         assert_eq!(mask_key("密钥密钥密钥密钥密钥"), "密钥密钥****密钥密钥");
+    }
+
+    #[test]
+    fn hostname_ignores_port_and_handles_ipv6() {
+        assert_eq!(hostname("example.com:8080"), "example.com");
+        assert_eq!(hostname("example.com"), "example.com");
+        assert_eq!(hostname("127.0.0.1:18080"), "127.0.0.1");
+        assert_eq!(hostname("[::1]:8080"), "[::1]");
+        assert_eq!(hostname("[::1]"), "[::1]");
     }
 
     #[test]
