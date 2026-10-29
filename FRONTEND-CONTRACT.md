@@ -57,6 +57,9 @@ Rust (Axum)
 所有接口都在 `/api` 下，JSON 请求体，返回 JSON；`204` 表示无内容。
 未登录统一返回 `401 {"error":"unauthorized"}`。
 
+**记录 ID 是对外 UUIDv7**（时间有序），数据库内部仍用自增主键：
+URL 里出现的是 `public_id`，内部 join/排序用 `id`。旧的数字 ID 已经不再可用（`404`）。
+
 | 方法 | 路径 | 请求 | 成功响应 |
 |---|---|---|---|
 | POST | `/api/auth/register` | `{username, password, password_confirm}` | `200 {user}` + Set-Cookie |
@@ -64,16 +67,16 @@ Rust (Axum)
 | POST | `/api/auth/logout` | — | `204` |
 | GET | `/api/me` | — | `200 {user}` / `401` |
 | GET | `/api/translations` | — | `200 {items:[summary]}` |
-| GET | `/api/translations/{id}` | — | `200 record`（含 `entries`） |
-| GET | `/api/translations/{id}/status` | — | `200 {total,done,status,entries}` |
-| POST | `/api/translations` | multipart | `202 {id}` |
-| POST | `/api/translations/{id}/edits` | `{"0":"译文","1":""}` | `204` |
-| POST | `/api/translations/{id}/annotate` | `{topic, note_lang}` | `202` / `409 busy` |
-| POST | `/api/translations/{id}/continue` | — | `202` / `409 busy` |
+| GET | `/api/translations/{uuid}` | — | `200 record`（含 `entries`） |
+| GET | `/api/translations/{uuid}/status` | — | `200 {total,done,status,entries}` |
+| POST | `/api/translations` | multipart | `202 {id: uuid}` |
+| POST | `/api/translations/{uuid}/edits` | `{"0":"译文","1":""}` | `204` |
+| POST | `/api/translations/{uuid}/annotate` | `{topic, note_lang}` | `202` / `409 busy` |
+| POST | `/api/translations/{uuid}/continue` | — | `202` / `409 busy` |
 | GET | `/api/settings` | — | `200 {has_key, masked_key}` |
 | PUT | `/api/settings` | `{api_key}` | `204` |
 | POST | `/api/lang` | `{lang}` | `204` + Set-Cookie |
-| GET | `/download/{id}/{format}` | — | 文件流（`Content-Disposition`） |
+| GET | `/download/{uuid}/{format}` | — | 文件流（`Content-Disposition`） |
 
 ### 上传（multipart）
 
@@ -91,7 +94,8 @@ Rust (Axum)
 
 ```jsonc
 // summary（列表）
-{ "id":1, "filename":"a.vtt", "kind":"subtitle|article|legacy",
+{ "id":"01a18708-9621-76b7-b7ce-907b34d7ce93", "filename":"a.vtt",
+  "kind":"subtitle|article|legacy",
   "source_lang":"en", "target_lang":"zh", "status":"running",
   "created_at":"2026-10-29 17:18", "total":246, "done":137 }
 

@@ -13,7 +13,10 @@ pub struct User {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct Translation {
+    /// 内部主键：只在服务端使用，不对外暴露
     pub id: i64,
+    /// 对外 ID（UUIDv7）：出现在 URL 和 API 里
+    pub public_id: String,
     pub user_id: i64,
     pub filename: String,
     pub source_text: String,

@@ -36,6 +36,7 @@ pub async fn run_migrations(pool: &Pool<SqliteDb>) -> Result<()> {
             translated_text TEXT NOT NULL,
             source_lang TEXT NOT NULL DEFAULT 'en',
             target_lang TEXT NOT NULL DEFAULT 'zh',
+            public_id TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'done',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
@@ -60,6 +61,35 @@ pub async fn run_migrations(pool: &Pool<SqliteDb>) -> Result<()> {
     let _ = sqlx::query("ALTER TABLE translations ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
         .execute(pool)
         .await;
+
+    // 对外 ID：UUIDv7（时间有序，可排序）。老数据先补列，再回填，最后建唯一索引。
+    let _ = sqlx::query("ALTER TABLE translations ADD COLUMN public_id TEXT")
+        .execute(pool)
+        .await;
+
+    let missing: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM translations WHERE public_id IS NULL OR public_id = ''")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    if !missing.is_empty() {
+        let count = missing.len();
+        for id in missing {
+            let public_id = uuid::Uuid::now_v7().to_string();
+            let _ = sqlx::query("UPDATE translations SET public_id = ? WHERE id = ?")
+                .bind(&public_id)
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+        tracing::info!("为 {} 条历史记录补充了 public_id", count);
+    }
+
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_public_id ON translations(public_id)",
+    )
+    .execute(pool)
+    .await;
 
     Ok(())
 }

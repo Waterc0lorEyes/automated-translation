@@ -203,7 +203,7 @@ fn record_json(t: &Translation, with_entries: bool) -> Value {
     };
 
     let mut body = json!({
-        "id": t.id,
+        "id": t.public_id,
         "filename": t.filename,
         "kind": kind,
         "source_lang": t.source_lang,
@@ -227,10 +227,12 @@ fn progress_done<T: Segment>(items: &[T]) -> usize {
         .count()
 }
 
-async fn fetch_record(state: &AppState, user_id: i64, id: i64) -> Option<Translation> {
-    sqlx::query_as::<_, Translation>("SELECT * FROM translations WHERE id = ? AND user_id = ?")
-        .bind(id)
-        .bind(user_id)
+async fn fetch_record(state: &AppState, user_id: i64, public_id: &str) -> Option<Translation> {
+    sqlx::query_as::<_, Translation>(
+        "SELECT * FROM translations WHERE public_id = ? AND user_id = ?",
+    )
+    .bind(public_id)
+    .bind(user_id)
         .fetch_optional(&state.pool)
         .await
         .ok()
@@ -366,25 +368,25 @@ async fn list_translations(State(state): State<Arc<AppState>>, jar: Jar) -> Resp
     }
 }
 
-async fn get_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
+async fn get_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<String>) -> Response {
     let user = match require_user(&jar, &state).await {
         Ok(u) => u,
         Err(err) => return err.into_response(),
     };
 
-    match fetch_record(&state, user.id, id).await {
+    match fetch_record(&state, user.id, &id).await {
         Some(record) => Json(record_json(&record, true)).into_response(),
         None => api_error(StatusCode::NOT_FOUND, "not_found"),
     }
 }
 
-async fn get_status(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
+async fn get_status(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<String>) -> Response {
     let user = match require_user(&jar, &state).await {
         Ok(u) => u,
         Err(err) => return err.into_response(),
     };
 
-    let record = match fetch_record(&state, user.id, id).await {
+    let record = match fetch_record(&state, user.id, &id).await {
         Some(record) => record,
         None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
@@ -478,10 +480,12 @@ async fn create_subtitle(
     let entry_count = entries.len();
 
     let entries_json = serde_json::to_string(&entries).unwrap_or_default();
+    let public_id = uuid::Uuid::now_v7().to_string();
     let inserted = sqlx::query(
-        "INSERT INTO translations (user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
-         VALUES (?, ?, ?, ?, ?, ?, 'running')",
+        "INSERT INTO translations (public_id, user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'running')",
     )
+    .bind(&public_id)
     .bind(user.id)
     .bind(&filename)
     .bind(&content)
@@ -517,7 +521,7 @@ async fn create_subtitle(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
+    (StatusCode::ACCEPTED, Json(json!({ "id": public_id }))).into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -533,10 +537,12 @@ async fn create_article(
 ) -> Response {
     // 先落一条 "splitting" 占位记录：拆句要跑 AI，请求必须立刻返回
     let placeholder = serde_json::to_string(&json!({ "kind": "article", "segments": [] })).unwrap_or_default();
+    let public_id = uuid::Uuid::now_v7().to_string();
     let inserted = sqlx::query(
-        "INSERT INTO translations (user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
-         VALUES (?, ?, ?, ?, ?, ?, 'splitting')",
+        "INSERT INTO translations (public_id, user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'splitting')",
     )
+    .bind(&public_id)
     .bind(user.id)
     .bind(&filename)
     .bind(&content)
@@ -587,7 +593,7 @@ async fn create_article(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
+    (StatusCode::ACCEPTED, Json(json!({ "id": public_id }))).into_response()
 }
 
 async fn build_segments(api_key: &str, text: &str, source_lang: &str) -> anyhow::Result<Vec<ArticleSegment>> {
@@ -614,7 +620,7 @@ async fn build_segments(api_key: &str, text: &str, source_lang: &str) -> anyhow:
 async fn put_edits(
     State(state): State<Arc<AppState>>,
     jar: Jar,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Json(data): Json<Value>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
@@ -622,10 +628,11 @@ async fn put_edits(
         Err(err) => return err.into_response(),
     };
 
-    let record = match fetch_record(&state, user.id, id).await {
+    let record = match fetch_record(&state, user.id, &id).await {
         Some(record) => record,
         None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
+    let internal_id = record.id;
 
     let empty = serde_json::Map::new();
     let fields = data.as_object().unwrap_or(&empty);
@@ -642,10 +649,10 @@ async fn put_edits(
 
     match translator::parse_content(&record.translated_text) {
         Some(ParsedContent::Subtitles(_)) => {
-            translator::merge_edits::<SubtitleEntry>(&state.pool, id, &edits).await;
+            translator::merge_edits::<SubtitleEntry>(&state.pool, internal_id, &edits).await;
         }
         Some(ParsedContent::Article(_)) => {
-            translator::merge_edits::<ArticleSegment>(&state.pool, id, &edits).await;
+            translator::merge_edits::<ArticleSegment>(&state.pool, internal_id, &edits).await;
         }
         None => return api_error(StatusCode::CONFLICT, "legacy_format"),
     }
@@ -656,7 +663,7 @@ async fn put_edits(
 async fn annotate(
     State(state): State<Arc<AppState>>,
     jar: Jar,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Json(form): Json<AnnotateForm>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
@@ -675,17 +682,18 @@ async fn annotate(
     }
     let note_lang = form.note_lang.unwrap_or_else(|| "zh".to_string());
 
-    let record = match fetch_record(&state, user.id, id).await {
+    let record = match fetch_record(&state, user.id, &id).await {
         Some(record) => record,
         None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
+    let internal_id = record.id;
 
     let content = match translator::parse_content(&record.translated_text) {
         Some(content) => content,
         None => return api_error(StatusCode::CONFLICT, "legacy_format"),
     };
 
-    if !translator::try_claim(&state.pool, id).await {
+    if !translator::try_claim(&state.pool, internal_id).await {
         return api_error(StatusCode::CONFLICT, "busy");
     }
 
@@ -701,14 +709,14 @@ async fn annotate(
     match content {
         ParsedContent::Subtitles(entries) => {
             tokio::spawn(async move {
-                let (_, result) = translator::generate_annotations_owned::<SubtitleEntry>(key, entries, prompt, pool.clone(), id).await;
-                finish_job(&pool, id, result).await;
+                let (_, result) = translator::generate_annotations_owned::<SubtitleEntry>(key, entries, prompt, pool.clone(), internal_id).await;
+                finish_job(&pool, internal_id, result).await;
             });
         }
         ParsedContent::Article(segments) => {
             tokio::spawn(async move {
-                let (_, result) = translator::generate_annotations_owned::<ArticleSegment>(key, segments, prompt, pool.clone(), id).await;
-                finish_job(&pool, id, result).await;
+                let (_, result) = translator::generate_annotations_owned::<ArticleSegment>(key, segments, prompt, pool.clone(), internal_id).await;
+                finish_job(&pool, internal_id, result).await;
             });
         }
     }
@@ -716,7 +724,7 @@ async fn annotate(
     (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
 }
 
-async fn continue_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
+async fn continue_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<String>) -> Response {
     let user = match require_user(&jar, &state).await {
         Ok(u) => u,
         Err(err) => return err.into_response(),
@@ -727,12 +735,13 @@ async fn continue_translation(State(state): State<Arc<AppState>>, jar: Jar, Path
         return api_error(StatusCode::BAD_REQUEST, "no_api_key");
     }
 
-    let record = match fetch_record(&state, user.id, id).await {
+    let record = match fetch_record(&state, user.id, &id).await {
         Some(record) => record,
         None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
+    let internal_id = record.id;
 
-    if !translator::try_claim(&state.pool, id).await {
+    if !translator::try_claim(&state.pool, internal_id).await {
         return api_error(StatusCode::CONFLICT, "busy");
     }
 
@@ -743,30 +752,30 @@ async fn continue_translation(State(state): State<Arc<AppState>>, jar: Jar, Path
     match translator::parse_content(&record.translated_text) {
         Some(ParsedContent::Subtitles(mut entries)) => {
             tokio::spawn(async move {
-                let result = translator::continue_translate(&api_key, &mut entries, &sl, &tl, "", &pool, id).await;
+                let result = translator::continue_translate(&api_key, &mut entries, &sl, &tl, "", &pool, internal_id).await;
                 match result {
-                    Ok(()) => translator::set_status(&pool, id, "done").await,
+                    Ok(()) => translator::set_status(&pool, internal_id, "done").await,
                     Err(e) => {
-                        tracing::error!("continue failed: {} id={}", e, id);
-                        translator::set_status(&pool, id, "failed").await;
+                        tracing::error!("continue failed: {} id={}", e, internal_id);
+                        translator::set_status(&pool, internal_id, "failed").await;
                     }
                 }
             });
         }
         Some(ParsedContent::Article(mut segments)) => {
             tokio::spawn(async move {
-                let result = translator::continue_translate_article(&api_key, &mut segments, &sl, &tl, "", &pool, id).await;
+                let result = translator::continue_translate_article(&api_key, &mut segments, &sl, &tl, "", &pool, internal_id).await;
                 match result {
-                    Ok(()) => translator::set_status(&pool, id, "done").await,
+                    Ok(()) => translator::set_status(&pool, internal_id, "done").await,
                     Err(e) => {
-                        tracing::error!("continue failed: {} id={}", e, id);
-                        translator::set_status(&pool, id, "failed").await;
+                        tracing::error!("continue failed: {} id={}", e, internal_id);
+                        translator::set_status(&pool, internal_id, "failed").await;
                     }
                 }
             });
         }
         None => {
-            translator::set_status(&state.pool, id, "done").await;
+            translator::set_status(&state.pool, internal_id, "done").await;
             return api_error(StatusCode::CONFLICT, "legacy_format");
         }
     }
@@ -857,17 +866,18 @@ fn current_lang(jar: &Jar) -> String {
 async fn download(
     State(state): State<Arc<AppState>>,
     jar: Jar,
-    Path((id, format)): Path<(i64, String)>,
+    Path((id, format)): Path<(String, String)>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
         Ok(u) => u,
         Err(_) => return api_error(StatusCode::UNAUTHORIZED, "unauthorized"),
     };
 
-    let record = match fetch_record(&state, user.id, id).await {
+    let record = match fetch_record(&state, user.id, &id).await {
         Some(record) => record,
         None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
+    let _ = &record.id;
 
     let format = format.to_ascii_lowercase();
     let base = strip_known_ext(&record.filename);
@@ -1112,6 +1122,7 @@ mod tests {
     fn record_json_marks_legacy_format() {
         let record = Translation {
             id: 1,
+            public_id: "0190a5c0-0000-7000-8000-000000000001".into(),
             user_id: 1,
             filename: "old.txt".into(),
             source_text: "x".into(),
