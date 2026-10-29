@@ -107,7 +107,27 @@ cargo run
 ```
 
 > **注意**：`static/` 是按相对路径加载的，必须在项目根目录启动。
-> 没有 API Key 时可以用 `node dev/mock-deepseek.mjs` 起一个假模型，见下文「开发模式」。
+
+#### 没有 API Key 时
+
+```bash
+node dev/mock-deepseek.mjs &          # 假模型，监听 3199
+DEEPSEEK_API_URL=http://127.0.0.1:3199/chat/completions \
+DEFAULT_API_KEY=mock-key cargo run
+```
+
+或者一条命令（release 构建 + 独立演示库 + mock 模型）：
+
+```bash
+cargo build --release
+./dev/run-demo.sh                     # http://0.0.0.0:18080
+```
+
+#### 前端开发模式
+
+```bash
+cd frontend && npm install && npm run dev   # 5173，/api 已代理到 3000
+```
 
 ### 5. 构建发布版
 
