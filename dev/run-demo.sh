@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# 起一个可公网访问的 demo 实例：mock DeepSeek + 真实后端（独立数据库）。
-# 用于没有 API Key 的验收环境；生产部署请直接跑二进制并配上真正的 Key。
+# 启动实例。
 #
-#   ./dev/run-demo.sh           # 前台运行，Ctrl-C 结束
-#   PORT=18080 ./dev/run-demo.sh
+#   ./dev/run-demo.sh          # 用 .env 里的配置（真 Key / 真库）
+#   MOCK=1 ./dev/run-demo.sh   # 强制用本地假模型 + 演示库，不消耗 API 额度
+#
+# 注意：环境变量的优先级高于 .env（dotenvy 不会覆盖已存在的变量），
+# 所以只有 MOCK=1 时才注入 mock 配置，避免悄悄顶掉生产 Key。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-
-export DATABASE_URL="${DATABASE_URL:-sqlite://data-spa.db}"
-export DEFAULT_API_KEY="${DEFAULT_API_KEY:-mock-key}"
-export DEEPSEEK_API_URL="${DEEPSEEK_API_URL:-http://127.0.0.1:3199/chat/completions}"
-export SESSION_SECRET="${SESSION_SECRET:-demo-session-secret-please-change-0123456789}"
-export COOKIE_SECURE="${COOKIE_SECURE:-false}"
-export PORT="${PORT:-18080}"
-export HOST="${HOST:-0.0.0.0}"
 
 BIN="./target/release/automated-translation"
 if [ ! -x "$BIN" ]; then
@@ -27,12 +21,19 @@ if [ ! -f static/index.html ]; then
   exit 1
 fi
 
-# mock 模型：已经有进程在监听就复用
-if ! curl -s -o /dev/null --max-time 1 http://127.0.0.1:3199/chat/completions; then
-  node dev/mock-deepseek.mjs >/tmp/mock-deepseek.log 2>&1 &
-  echo "mock deepseek: pid=$! log=/tmp/mock-deepseek.log"
-  sleep 0.6
+if [ "${MOCK:-0}" = "1" ]; then
+  export DEFAULT_API_KEY="${DEFAULT_API_KEY:-mock-key}"
+  export DEEPSEEK_API_URL="${DEEPSEEK_API_URL:-http://127.0.0.1:3199/chat/completions}"
+  export DATABASE_URL="${DATABASE_URL:-sqlite://data-spa.db}"
+
+  if ! curl -s -o /dev/null --max-time 1 "$DEEPSEEK_API_URL"; then
+    node dev/mock-deepseek.mjs >/tmp/mock-deepseek.log 2>&1 &
+    echo "mock deepseek: pid=$! log=/tmp/mock-deepseek.log"
+    sleep 0.6
+  fi
+  echo "MOCK 模式：假模型 + ${DATABASE_URL}"
+else
+  echo "使用 .env 配置"
 fi
 
-echo "starting on http://${HOST}:${PORT}  (db=${DATABASE_URL})"
 exec "$BIN"
