@@ -116,12 +116,14 @@ DEEPSEEK_API_URL=http://127.0.0.1:3199/chat/completions \
 DEFAULT_API_KEY=mock-key cargo run
 ```
 
-或者一条命令（release 构建 + 独立演示库 + mock 模型）：
+或者一条命令（release 构建 + 假模型 + 演示库，不消耗 API 额度）：
 
 ```bash
 cargo build --release
-./dev/run-demo.sh                     # http://0.0.0.0:18080
+MOCK=1 ./dev/run-demo.sh              # http://0.0.0.0:18080
 ```
+
+不带 `MOCK=1` 时直接用 `.env` 的配置（真 Key、真库）。
 
 #### 前端开发模式
 
