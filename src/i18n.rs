@@ -4,8 +4,6 @@
 //! 浏览器检测在 `routes::detect_language` 中间件里完成，检测结果以 lang Cookie 的形式
 //! 注入请求，因此各 handler 仍然只从 CookieJar 读取即可。
 
-use std::cmp::Ordering;
-
 pub const DEFAULT_LANG: &str = "zh";
 /// 支持的语言代码
 pub const SUPPORTED: [&str; 4] = ["zh", "zh-TW", "zh-HK", "en"];
@@ -58,58 +56,6 @@ impl I18n {
 pub fn is_supported(code: &str) -> bool {
     let lower = code.trim().to_ascii_lowercase();
     SUPPORTED.iter().any(|s| s.to_ascii_lowercase() == lower)
-}
-
-/// 从 `Accept-Language` 里挑一个支持的语言。
-pub fn detect_lang(accept: Option<&str>) -> &'static str {
-    let Some(accept) = accept else {
-        return DEFAULT_LANG;
-    };
-
-    let mut items: Vec<(f32, &str)> = accept
-        .split(',')
-        .filter_map(|part| {
-            let mut segs = part.split(';');
-            let tag = segs.next()?.trim();
-            if tag.is_empty() {
-                return None;
-            }
-            let q = segs
-                .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.parse::<f32>().ok()))
-                .unwrap_or(1.0);
-            Some((q, tag))
-        })
-        .collect();
-
-    // 按 q 值降序；q 相同的保持原顺序
-    items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-    for (q, tag) in items {
-        if q <= 0.0 {
-            continue;
-        }
-        if let Some(code) = match_tag(tag) {
-            return code;
-        }
-    }
-
-    DEFAULT_LANG
-}
-
-fn match_tag(tag: &str) -> Option<&'static str> {
-    let lower = tag.to_ascii_lowercase();
-    if lower.starts_with("zh") {
-        // 港/澳优先于泛繁体：zh-Hant-HK 应落到香港
-        if lower.ends_with("-hk") || lower.ends_with("-mo") {
-            return Some("zh-HK");
-        }
-        let traditional = lower.contains("hant") || lower.ends_with("-tw");
-        return Some(if traditional { "zh-TW" } else { "zh" });
-    }
-    if lower.starts_with("en") {
-        return Some("en");
-    }
-    None
 }
 
 fn get_translation(key: &str, idx: usize) -> &str {
@@ -300,56 +246,11 @@ mod tests {
         assert_eq!(I18n::new("zh").t("no_such_key"), "no_such_key");
     }
 
-    #[test]
-    fn detects_traditional_variants() {
-        for tag in ["zh-TW", "zh-Hant", "zh-Hant-TW", "zh-tw"] {
-            assert_eq!(match_tag(tag), Some("zh-TW"), "tag={tag}");
-        }
-    }
 
-    #[test]
-    fn detects_simplified_variants() {
-        for tag in ["zh", "zh-CN", "zh-Hans", "zh-SG"] {
-            assert_eq!(match_tag(tag), Some("zh"), "tag={tag}");
-        }
-    }
 
-    #[test]
-    fn detects_hong_kong_variants() {
-        for tag in ["zh-HK", "zh-MO", "zh-Hant-HK", "zh-hk"] {
-            assert_eq!(match_tag(tag), Some("zh-HK"), "tag={tag}");
-        }
-    }
 
-    #[test]
-    fn detects_english() {
-        assert_eq!(match_tag("en-US"), Some("en"));
-        assert_eq!(match_tag("en"), Some("en"));
-        assert_eq!(match_tag("fr"), None);
-    }
 
-    #[test]
-    fn accept_language_respects_quality() {
-        assert_eq!(detect_lang(Some("zh-TW,zh;q=0.9,en;q=0.8")), "zh-TW");
-        assert_eq!(detect_lang(Some("en-US,en;q=0.9,zh;q=0.5")), "en");
-        // q 值高的优先，即使写在后面
-        assert_eq!(detect_lang(Some("en;q=0.2,zh-TW;q=0.9")), "zh-TW");
-        // 不支持的语言跳过
-        assert_eq!(detect_lang(Some("fr-FR,fr;q=0.9")), DEFAULT_LANG);
-        // q=0 表示明确不接受
-        assert_eq!(detect_lang(Some("en;q=0,zh-TW;q=0.5")), "zh-TW");
-        // 香港优先于泛繁体
-        assert_eq!(detect_lang(Some("zh-HK,zh;q=0.9")), "zh-HK");
-        assert_eq!(detect_lang(Some("zh-Hant-HK,zh-Hant;q=0.8")), "zh-HK");
-    }
 
-    #[test]
-    fn accept_language_edge_cases() {
-        assert_eq!(detect_lang(None), DEFAULT_LANG);
-        assert_eq!(detect_lang(Some("")), DEFAULT_LANG);
-        assert_eq!(detect_lang(Some("   ")), DEFAULT_LANG);
-        assert_eq!(detect_lang(Some("*")), DEFAULT_LANG);
-    }
 
     #[test]
     fn supported_codes_are_recognised() {

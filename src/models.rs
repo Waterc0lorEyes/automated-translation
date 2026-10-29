@@ -38,11 +38,6 @@ pub struct LoginForm {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ApiKeyForm {
-    pub api_key: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubtitleEntry {
     pub index: usize,

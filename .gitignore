@@ -5,3 +5,8 @@
 *.db-wal
 *.log
 .env
+/frontend/node_modules
+/frontend/dist
+/data-spa.db
+/data-spa.db-shm
+/data-spa.db-wal

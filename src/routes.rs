@@ -1,31 +1,43 @@
+//! JSON API + SPA 静态资源服务。
+//!
+//! 前端是 Vue SPA，所有页面逻辑在 `frontend/`，构建产物落在 `static/`。
+//! 这里只负责三件事：
+//!   1. `/api/*` 的 JSON 接口
+//!   2. `/download/{id}/{format}` 的文件下载（浏览器直接跳转，不走 fetch）
+//!   3. 其余路径回退到 `static/index.html`，交给 Vue Router
+//!
+//! 认证仍然是签名 Cookie（见 session.rs），所以 fetch 一律 `credentials: same-origin`。
+//! 所有写操作额外做了 Origin 校验：SameSite=Lax 已经挡住跨站 POST，
+//! 这里再加一层，防止未来改成 SameSite=None 时裸奔。
+
 use std::sync::Arc;
 
 use argon2::{
-    Argon2,
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
 };
 use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{Html, IntoResponse, Redirect, Response},
+    extract::{Multipart, Path, Request, State},
+    http::{header, HeaderValue, Method, StatusCode, Uri},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Form, Router, Json,
+    Json, Router,
 };
-use axum_extra::extract::cookie::{CookieJar as Cookies, Cookie};
+use axum_extra::extract::cookie::{Cookie, CookieJar as Jar, SameSite};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use tera::Tera;
+use tower_http::services::ServeDir;
 
-use crate::models::{ApiKeyForm, AnnotateForm, ArticleSegment, LoginForm, RegisterForm, Translation, User, SubtitleEntry};
-use crate::parser::parse_subtitles;
 use crate::i18n::I18n;
+use crate::models::{AnnotateForm, ArticleSegment, LoginForm, RegisterForm, SubtitleEntry, Translation, User};
+use crate::parser::parse_subtitles;
 use crate::session;
-use crate::translator::Segment;
-use crate::translator;
+use crate::translator::{self, ParsedContent, Segment};
 
 pub struct AppState {
     pub pool: SqlitePool,
-    pub tera: Tera,
     pub default_api_key: String,
     /// 会话签名密钥
     pub session_secret: Vec<u8>,
@@ -33,70 +45,94 @@ pub struct AppState {
     pub cookie_secure: bool,
 }
 
+/* ------------------------------------------------------------------ */
+/* 路由                                                                */
+/* ------------------------------------------------------------------ */
+
 pub fn router() -> Router<Arc<AppState>> {
+    let api = Router::new()
+        .route("/auth/register", post(register))
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/me", get(me))
+        .route("/translations", get(list_translations).post(create_translation))
+        .route("/translations/{id}", get(get_translation))
+        .route("/translations/{id}/status", get(get_status))
+        .route("/translations/{id}/edits", post(put_edits))
+        .route("/translations/{id}/annotate", post(annotate))
+        .route("/translations/{id}/continue", post(continue_translation))
+        .route("/settings", get(settings_get).put(settings_put))
+        .route("/lang", post(set_lang))
+        .fallback(api_not_found);
+
     Router::new()
-        .route("/setlang/{lang}", get(setlang_handler))
-        .route("/", get(home))
-        .route("/login", get(login_page).post(login_handler))
-        .route("/register", get(register_page).post(register_handler))
-        .route("/logout", get(logout_handler))
-        .route("/subtitle", get(subtitle_page).post(subtitle_handler))
-        .route("/article", get(article_page).post(article_handler))
-        .route("/result/{id}", get(result_page))
-        .route("/edit/{id}", post(edit_handler))
-        .route("/continue-translate/{id}", post(continue_translate_handler))
-        .route("/annotate/{id}", post(annotate_handler))
-        .route("/download/{id}/{format}", get(download_handler))
-        .route("/history", get(history_page))
-        .route("/settings", get(settings_page).post(settings_handler))
-        .route("/api/status/{id}", get(status_handler))
+        .nest("/api", api)
+        .route("/download/{id}/{format}", get(download))
+        // 静态文件优先，找不到再回退到 index.html（Vue Router 接管）
+        .fallback_service(ServeDir::new("static").fallback(get(spa_index)))
 }
 
-type Jar = Cookies;
+/// 写操作的 Origin 校验：Origin 的 authority 必须和 Host 一致。
+pub async fn origin_guard(req: Request, next: Next) -> Response {
+    let mutating = matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
 
-/// 没有显式 lang Cookie 时，按浏览器 `Accept-Language` 选语言，
-/// 把结果合成到请求的 Cookie 头里，后续 handler 无需感知。
-pub async fn detect_language(
-    mut req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let existing = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let has_lang = existing
-        .split(';')
-        .any(|c| c.trim_start().starts_with("lang="));
-
-    if !has_lang {
-        let accept = req
+    if mutating {
+        let origin = req
             .headers()
-            .get(header::ACCEPT_LANGUAGE)
-            .and_then(|v| v.to_str().ok());
-        let lang = crate::i18n::detect_lang(accept);
-        let merged = if existing.is_empty() {
-            format!("lang={}", lang)
-        } else {
-            format!("{}; lang={}", existing, lang)
-        };
-        if let Ok(value) = HeaderValue::from_str(&merged) {
-            req.headers_mut().insert(header::COOKIE, value);
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+
+        if let Some(origin) = origin {
+            let origin_host = origin.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+            if !host.is_empty() && !origin_host.eq_ignore_ascii_case(&host) {
+                tracing::warn!("拒绝跨站写请求: origin={} host={}", origin, host);
+                return api_error(StatusCode::FORBIDDEN, "bad_origin");
+            }
         }
     }
 
     next.run(req).await
 }
 
-fn get_user_id(jar: &Jar, state: &AppState) -> Option<i64> {
-    let raw = jar.get(session::COOKIE_NAME)?.value();
-    session::verify(&state.session_secret, raw)
+/* ------------------------------------------------------------------ */
+/* 小工具                                                              */
+/* ------------------------------------------------------------------ */
+
+fn api_error(status: StatusCode, code: &str) -> Response {
+    (status, Json(json!({ "error": code }))).into_response()
 }
 
-async fn require_user(jar: &Jar, state: &AppState) -> Option<User> {
-    let user_id = get_user_id(jar, state)?;
+/// `require_user` 的错误用这个小结构，避免 `Result<User, Response>` 触发
+/// clippy::result_large_err（Response 很大）。
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.code }))).into_response()
+    }
+}
+
+fn internal(e: impl std::fmt::Display) -> Response {
+    tracing::error!("api error: {}", e);
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+}
+
+async fn get_user(jar: &Jar, state: &AppState) -> Option<User> {
+    let raw = jar.get(session::COOKIE_NAME)?.value();
+    let user_id = session::verify(&state.session_secret, raw)?;
     sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(&state.pool)
@@ -105,342 +141,359 @@ async fn require_user(jar: &Jar, state: &AppState) -> Option<User> {
         .flatten()
 }
 
-fn current_lang(jar: &Jar) -> String {
-    let raw = jar
-        .get("lang")
-        .map(|c| c.value().to_string())
-        .unwrap_or_else(|| crate::i18n::DEFAULT_LANG.to_string());
-    if crate::i18n::is_supported(&raw) {
-        raw
-    } else {
-        crate::i18n::DEFAULT_LANG.to_string()
-    }
+async fn require_user(jar: &Jar, state: &AppState) -> Result<User, ApiError> {
+    get_user(jar, state).await.ok_or(ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "unauthorized",
+    })
 }
 
-fn render_with(state: &Arc<AppState>, jar: Jar, template: &str, mut ctx: tera::Context) -> Response {
-    let lang = current_lang(&jar);
-    let i18n = I18n::new(&lang);
-    t_ctx(&i18n, &mut ctx);
-    ctx.insert("lang", &lang);
-    let body = match state.tera.render(template, &ctx) {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => {
-            Html(format!("<pre>Template error: {}</pre>", e)).into_response()
-        }
+fn get_api_key(user: &User, state: &AppState) -> String {
+    let key = user.api_key.as_deref().unwrap_or("");
+    if !key.is_empty() {
+        return key.to_string();
+    }
+    state.default_api_key.clone()
+}
+
+fn user_json(user: &User, state: &AppState) -> Value {
+    let key = get_api_key(user, state);
+    json!({
+        "id": user.id,
+        "username": user.username,
+        "has_key": !key.is_empty(),
+        "masked_key": mask_key(&key),
+    })
+}
+
+fn fmt_time(t: chrono::NaiveDateTime) -> String {
+    t.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// 把一条记录拆成 JSON。`with_entries=false` 用于列表，避免一次传几百 KB。
+fn record_json(t: &Translation, with_entries: bool) -> Value {
+    let parsed = translator::parse_content(&t.translated_text);
+    let (kind, entries, total, done) = match &parsed {
+        Some(ParsedContent::Subtitles(items)) => (
+            "subtitle",
+            serde_json::to_value(items).unwrap_or(Value::Null),
+            items.len(),
+            progress_done(items),
+        ),
+        Some(ParsedContent::Article(items)) => (
+            "article",
+            serde_json::to_value(items).unwrap_or(Value::Null),
+            items.len(),
+            progress_done(items),
+        ),
+        None => ("legacy", Value::Null, 0, 0),
     };
-    (jar, body).into_response()
+
+    let mut body = json!({
+        "id": t.id,
+        "filename": t.filename,
+        "kind": kind,
+        "source_lang": t.source_lang,
+        "target_lang": t.target_lang,
+        "status": t.status,
+        "created_at": fmt_time(t.created_at),
+        "total": total,
+        "done": done,
+    });
+
+    if with_entries {
+        body["entries"] = entries;
+    }
+    body
 }
 
-fn t_ctx(i18n: &I18n, ctx: &mut tera::Context) {
-    let keys = [
-        "nav_subtitle","nav_article","nav_history","nav_settings","nav_logout",
-        "title_subtitle","title_article","title_history","title_settings","title_result",
-        "title_index","title_login","title_register",
-        "hero_subtitle","hero_article","hero_index","hero_index_sub",
-        "h1_trans_result","h2_annot","h2_compare","h2_seg",
-        "splitting_msg","task_failed","busy_msg","legacy_msg",
-        "h2_upload_sub","h2_upload_art","h2_recent","h1_login","h1_register","h1_settings","h1_history",
-        "label_source","label_target","label_file","label_file_art","label_paste","label_paste_art","drop_hint",
-        "label_prompt","label_username","label_password","label_confirm","label_api_key",
-        "label_annot_topic","label_annot_lang","label_annot_lang_en","label_annot_lang_ja",
-        "btn_translate","btn_login","btn_register","btn_save","btn_save_edit","btn_cancel",
-        "btn_annot_gen","btn_continue","btn_download_vtt","btn_download_srt","btn_download_txt",
-        "btn_edit","btn_start_sub","btn_start_art","btn_dl_trans","btn_dl_source","btn_dl_table",
-        "th_index","th_time","th_original","th_translation","th_note","th_filename","th_lang",
-        "th_actions","th_view","divider_or","file","time",
-        "auth_no_account","auth_has_account","auth_link","auth_link_login",
-        "auth_error_invalid","auth_error_empty","auth_error_mismatch","auth_error_short",
-        "auth_error_taken","auth_error_db","auth_register_success",
-        "annot_failed","settings_saved","settings_current","settings_get_key",
-        "no_translations","no_content","no_api_key","saving","saved","save_failed",
-            ];
-    for key in &keys {
-        ctx.insert(*key, i18n.t(key));
+fn progress_done<T: Segment>(items: &[T]) -> usize {
+    items
+        .iter()
+        .filter(|e| e.translation().is_some_and(|t| !t.is_empty()))
+        .count()
+}
+
+async fn fetch_record(state: &AppState, user_id: i64, id: i64) -> Option<Translation> {
+    sqlx::query_as::<_, Translation>("SELECT * FROM translations WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn finish_job(pool: &SqlitePool, id: i64, result: anyhow::Result<()>) {
+    match result {
+        Ok(()) => translator::set_status(pool, id, "done").await,
+        Err(e) => {
+            tracing::error!("bg job failed: {} id={}", e, id);
+            translator::set_status(pool, id, "failed").await;
+        }
     }
 }
 
-fn ok(jar: Jar, body: impl IntoResponse) -> Response {
-    (jar, body).into_response()
-}
+/* ------------------------------------------------------------------ */
+/* 认证                                                                */
+/* ------------------------------------------------------------------ */
 
-async fn setlang_handler(jar: Jar, Path(lang): Path<String>) -> Response {
-    // 只接受支持的语言代码，避免把任意字符串写进 Cookie
-    if !crate::i18n::is_supported(&lang) {
-        return ok(jar, Redirect::to("/"));
+async fn register(State(state): State<Arc<AppState>>, jar: Jar, Json(form): Json<RegisterForm>) -> Response {
+    if form.username.trim().is_empty() || form.password.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "empty_fields");
     }
-    let cookie = Cookie::build(("lang", lang))
-        .path("/")
-        .max_age(time::Duration::days(365))
-        .build();
-    ok(jar.add(cookie), Redirect::to("/"))
-}
-
-async fn home(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
-    let user = require_user(&jar, &state).await;
-    if user.is_none() {
-        return ok(jar, Redirect::to("/login"));
+    if form.password != form.password_confirm {
+        return api_error(StatusCode::BAD_REQUEST, "password_mismatch");
     }
-    let user = user.unwrap();
-
-    let translations = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE user_id = ? ORDER BY created_at DESC LIMIT 20"
-    )
-    .bind(user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    ctx.insert("translations", &translations);
-
-    render_with(&state, jar, "index.html", ctx)
-}
-
-async fn login_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
-    if require_user(&jar, &state).await.is_some() {
-        return ok(jar, Redirect::to("/"));
+    if form.password.len() < 4 {
+        return api_error(StatusCode::BAD_REQUEST, "password_short");
     }
-    let mut ctx = tera::Context::new();
-    ctx.insert("error", "");
-    render_with(&state, jar, "login.html", ctx)
-}
 
-async fn login_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Form(form): Form<LoginForm>,
-) -> Response {
-    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
+    let existing = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?")
         .bind(&form.username)
+        .fetch_one(&state.pool)
+        .await;
+
+    match existing {
+        Ok(count) if count > 0 => return api_error(StatusCode::CONFLICT, "username_taken"),
+        Err(e) => return internal(e),
+        _ => {}
+    }
+
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = match Argon2::default().hash_password(form.password.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
+        Err(e) => return internal(e),
+    };
+
+    let inserted = sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, ?)")
+        .bind(form.username.trim())
+        .bind(&password_hash)
+        .execute(&state.pool)
+        .await;
+
+    let id = match inserted {
+        Ok(r) => r.last_insert_rowid(),
+        Err(e) if e.to_string().contains("UNIQUE") => {
+            return api_error(StatusCode::CONFLICT, "username_taken")
+        }
+        Err(e) => return internal(e),
+    };
+
+    let user = User {
+        id,
+        username: form.username.trim().to_string(),
+        password_hash,
+        api_key: None,
+        created_at: chrono::Utc::now().naive_utc(),
+    };
+    let jar = jar.add(session::build_cookie(&state.session_secret, id, state.cookie_secure));
+
+    (jar, Json(json!({ "user": user_json(&user, &state) }))).into_response()
+}
+
+async fn login(State(state): State<Arc<AppState>>, jar: Jar, Json(form): Json<LoginForm>) -> Response {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
+        .bind(form.username.trim())
         .fetch_optional(&state.pool)
         .await;
 
     let user = match user {
         Ok(Some(u)) => u,
-        _ => {
-            let mut ctx = tera::Context::new();
-            ctx.insert("error", "invalid");
-            return render_with(&state, jar, "login.html", ctx);
-        }
+        Ok(None) => return api_error(StatusCode::UNAUTHORIZED, "invalid_credentials"),
+        Err(e) => return internal(e),
     };
 
-    let parsed_hash = match PasswordHash::new(&user.password_hash) {
-        Ok(h) => h,
-        Err(_) => {
-            let mut ctx = tera::Context::new();
-            ctx.insert("error", "invalid");
-            return render_with(&state, jar, "login.html", ctx);
-        }
+    let ok = PasswordHash::new(&user.password_hash)
+        .map(|hash| Argon2::default().verify_password(form.password.as_bytes(), &hash).is_ok())
+        .unwrap_or(false);
+
+    if !ok {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid_credentials");
+    }
+
+    let jar = jar.add(session::build_cookie(&state.session_secret, user.id, state.cookie_secure));
+    (jar, Json(json!({ "user": user_json(&user, &state) }))).into_response()
+}
+
+async fn logout(jar: Jar) -> Response {
+    (jar.remove(session::clear_cookie()), StatusCode::NO_CONTENT).into_response()
+}
+
+async fn me(State(state): State<Arc<AppState>>, jar: Jar) -> Response {
+    match require_user(&jar, &state).await {
+        Ok(user) => Json(json!({ "user": user_json(&user, &state) })).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 记录                                                                */
+/* ------------------------------------------------------------------ */
+
+async fn list_translations(State(state): State<Arc<AppState>>, jar: Jar) -> Response {
+    let user = match require_user(&jar, &state).await {
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
 
-    let valid = Argon2::default()
-        .verify_password(form.password.as_bytes(), &parsed_hash)
-        .is_ok();
-
-    if !valid {
-        let mut ctx = tera::Context::new();
-        ctx.insert("error", "invalid");
-        return render_with(&state, jar, "login.html", ctx);
-    }
-
-    let jar = jar.add(session::build_cookie(
-        &state.session_secret,
-        user.id,
-        state.cookie_secure,
-    ));
-    ok(jar, Redirect::to("/"))
-}
-
-async fn register_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
-    if require_user(&jar, &state).await.is_some() {
-        return ok(jar, Redirect::to("/"));
-    }
-    let mut ctx = tera::Context::new();
-    ctx.insert("error", "");
-    render_with(&state, jar, "register.html", ctx)
-}
-
-async fn register_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Form(form): Form<RegisterForm>,
-) -> Response {
-    let mut ctx = tera::Context::new();
-
-    if form.username.trim().is_empty() || form.password.is_empty() {
-        ctx.insert("error", "empty_fields");
-        return render_with(&state, jar, "register.html", ctx);
-    }
-    if form.password != form.password_confirm {
-        ctx.insert("error", "password_mismatch");
-        return render_with(&state, jar, "register.html", ctx);
-    }
-    if form.password.len() < 4 {
-        ctx.insert("error", "password_short");
-        return render_with(&state, jar, "register.html", ctx);
-    }
-
-    let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE username = ?"
+    let rows = sqlx::query_as::<_, Translation>(
+        "SELECT * FROM translations WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 100",
     )
-    .bind(&form.username)
-    .fetch_one(&state.pool)
+    .bind(user.id)
+    .fetch_all(&state.pool)
     .await;
 
-    match existing {
-        Ok(count) if count > 0 => {
-            ctx.insert("error", "username_taken");
-            return render_with(&state, jar, "register.html", ctx);
+    match rows {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.iter().map(|t| record_json(t, false)).collect();
+            Json(json!({ "items": items })).into_response()
         }
-        Err(_) => {
-            ctx.insert("error", "db_error");
-            return render_with(&state, jar, "register.html", ctx);
-        }
-        _ => {}
+        Err(e) => internal(e),
     }
+}
 
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = match argon2.hash_password(form.password.as_bytes(), &salt) {
-        Ok(h) => h.to_string(),
-        Err(_) => {
-            ctx.insert("error", "server_error");
-            return render_with(&state, jar, "register.html", ctx);
-        }
+async fn get_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
+    let user = match require_user(&jar, &state).await {
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
 
-    let _ = sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, ?)")
-        .bind(&form.username)
-        .bind(&password_hash)
-        .execute(&state.pool)
-        .await;
-
-    ok(jar, Redirect::to("/login?registered=1"))
+    match fetch_record(&state, user.id, id).await {
+        Some(record) => Json(record_json(&record, true)).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "not_found"),
+    }
 }
 
-async fn logout_handler(jar: Jar) -> Response {
-    let jar = jar.remove(session::clear_cookie());
-    ok(jar, Redirect::to("/login"))
-}
-
-async fn subtitle_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
+async fn get_status(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
     let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    ctx.insert("error", "");
-    render_with(&state, jar, "subtitle.html", ctx)
+
+    let record = match fetch_record(&state, user.id, id).await {
+        Some(record) => record,
+        None => return api_error(StatusCode::NOT_FOUND, "not_found"),
+    };
+
+    let body = record_json(&record, true);
+    Json(json!({
+        "total": body["total"],
+        "done": body["done"],
+        "status": body["status"],
+        "entries": body["entries"],
+    }))
+    .into_response()
 }
 
-fn get_api_key(user: &User, state: &AppState) -> String {
-    let key = user.api_key.as_deref().unwrap_or("");
-    if !key.is_empty() { return key.to_string(); }
-    if !state.default_api_key.is_empty() { return state.default_api_key.clone(); }
-    String::new()
-}
-
-async fn subtitle_handler(
+/// 上传并启动翻译。multipart 字段与旧表单保持一致：
+/// kind=subtitle|article，file 或 text，source_lang，target_lang，prompt。
+async fn create_translation(
     State(state): State<Arc<AppState>>,
     jar: Jar,
-    mut multipart: axum::extract::Multipart,
+    mut multipart: Multipart,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
 
     let api_key = get_api_key(&user, &state);
     if api_key.is_empty() {
-        return ok(jar, Redirect::to("/settings?error=no_api_key"));
+        return api_error(StatusCode::BAD_REQUEST, "no_api_key");
     }
 
-    let mut filename = String::from("subtitle.vtt");
-    let mut file_content = String::new();
-    let mut custom_prompt = String::new();
+    let mut kind = String::from("subtitle");
+    let mut filename = String::new();
+    let mut content = String::new();
+    let mut prompt = String::new();
     let mut source_lang = String::from("en");
     let mut target_lang = String::from("zh");
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
+            "kind" => kind = field.text().await.unwrap_or_default(),
             "file" => {
-                filename = field.file_name().unwrap_or("subtitle.vtt").to_string();
-                file_content = field.text().await.unwrap_or_default();
+                filename = field.file_name().unwrap_or("").to_string();
+                content = field.text().await.unwrap_or_default();
             }
             "text" => {
                 let text = field.text().await.unwrap_or_default();
-                if !text.is_empty() { file_content = text; }
+                if !text.is_empty() {
+                    content = text;
+                }
             }
-            "prompt" => { custom_prompt = field.text().await.unwrap_or_default(); }
-            "source_lang" => { source_lang = field.text().await.unwrap_or_default(); }
-            "target_lang" => { target_lang = field.text().await.unwrap_or_default(); }
+            "prompt" => prompt = field.text().await.unwrap_or_default(),
+            "source_lang" => source_lang = field.text().await.unwrap_or_default(),
+            "target_lang" => target_lang = field.text().await.unwrap_or_default(),
             _ => {}
         }
     }
 
-    if file_content.trim().is_empty() {
-        let mut ctx = tera::Context::new();
-        ctx.insert("username", &user.username);
-        ctx.insert("error", "no_content");
-        return render_with(&state, jar, "subtitle.html", ctx);
+    if content.trim().is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "no_content");
     }
 
-    let entries = parse_subtitles(&file_content);
-    let entry_count = entries.len();
-    if entry_count == 0 {
-        let mut ctx = tera::Context::new();
-        ctx.insert("username", &user.username);
-        ctx.insert("error", "未能从文件中解析出字幕条目，请检查格式");
-        return render_with(&state, jar, "subtitle.html", ctx);
+    let is_article = kind == "article";
+    if filename.trim().is_empty() {
+        filename = if is_article { "article.txt" } else { "subtitle.vtt" }.to_string();
     }
-    tracing::info!("subtitle: {} entries, {}→{}", entry_count, source_lang, target_lang);
+
+    if is_article {
+        create_article(&state, &user, api_key, filename, content, source_lang, target_lang, prompt).await
+    } else {
+        create_subtitle(&state, &user, api_key, filename, content, source_lang, target_lang, prompt).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_subtitle(
+    state: &Arc<AppState>,
+    user: &User,
+    api_key: String,
+    filename: String,
+    content: String,
+    source_lang: String,
+    target_lang: String,
+    prompt: String,
+) -> Response {
+    let entries = parse_subtitles(&content);
+    if entries.is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "parse_failed");
+    }
+    let entry_count = entries.len();
 
     let entries_json = serde_json::to_string(&entries).unwrap_or_default();
-    let save_result = sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO translations (user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
-         VALUES (?, ?, ?, ?, ?, ?, 'running')"
+         VALUES (?, ?, ?, ?, ?, ?, 'running')",
     )
-    .bind(user.id).bind(&filename).bind(&file_content).bind(&entries_json)
-    .bind(&source_lang).bind(&target_lang)
-    .execute(&state.pool).await;
+    .bind(user.id)
+    .bind(&filename)
+    .bind(&content)
+    .bind(&entries_json)
+    .bind(&source_lang)
+    .bind(&target_lang)
+    .execute(&state.pool)
+    .await;
 
-    let id = match save_result {
+    let id = match inserted {
         Ok(r) => r.last_insert_rowid(),
-        Err(_) => {
-            let mut ctx = tera::Context::new();
-            ctx.insert("username", &user.username);
-            ctx.insert("error", "Failed to save translation");
-            return render_with(&state, jar, "subtitle.html", ctx);
-        }
+        Err(e) => return internal(e),
     };
 
-    // background translate
+    tracing::info!("subtitle: {} entries, {}→{} id={}", entry_count, source_lang, target_lang, id);
+
     let pool = state.pool.clone();
-    let api_key_clone = api_key.clone();
+    let key = api_key.clone();
     let sl = source_lang.clone();
     let tl = target_lang.clone();
     tokio::spawn(async move {
-        let (entries, result) = translator::translate_subtitles_owned(
-            api_key_clone, entries, sl, tl, custom_prompt, pool.clone(), id,
-        ).await;
+        let (entries, result) = translator::translate_subtitles_owned(key, entries, sl, tl, prompt, pool.clone(), id).await;
         match result {
             Ok(()) => {
-                let filled = entries.iter().filter(|e| e.translation.as_deref().is_some_and(|t| !t.is_empty())).count();
+                let filled = progress_done(&entries);
                 translator::set_status(&pool, id, "done").await;
                 tracing::info!("bg translate done: {}/{} id={}", filled, entry_count, id);
             }
@@ -451,107 +504,50 @@ async fn subtitle_handler(
         }
     });
 
-    ok(jar, Redirect::to(&format!("/result/{}", id)))
+    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
 }
 
-async fn article_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
+#[allow(clippy::too_many_arguments)]
+async fn create_article(
+    state: &Arc<AppState>,
+    user: &User,
+    api_key: String,
+    filename: String,
+    content: String,
+    source_lang: String,
+    target_lang: String,
+    prompt: String,
 ) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
-    };
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    ctx.insert("error", "");
-    render_with(&state, jar, "article.html", ctx)
-}
-
-async fn article_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    mut multipart: axum::extract::Multipart,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
-    };
-
-    let api_key = get_api_key(&user, &state);
-    if api_key.is_empty() {
-        return ok(jar, Redirect::to("/settings?error=no_api_key"));
-    }
-
-    let mut filename = String::from("article.txt");
-    let mut file_content = String::new();
-    let mut custom_prompt = String::new();
-    let mut source_lang = String::from("en");
-    let mut target_lang = String::from("zh");
-
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "file" => {
-                filename = field.file_name().unwrap_or("article.txt").to_string();
-                file_content = field.text().await.unwrap_or_default();
-            }
-            "text" => {
-                let text = field.text().await.unwrap_or_default();
-                if !text.is_empty() { file_content = text; }
-            }
-            "prompt" => { custom_prompt = field.text().await.unwrap_or_default(); }
-            "source_lang" => { source_lang = field.text().await.unwrap_or_default(); }
-            "target_lang" => { target_lang = field.text().await.unwrap_or_default(); }
-            _ => {}
-        }
-    }
-
-    if file_content.trim().is_empty() {
-        let mut ctx = tera::Context::new();
-        ctx.insert("username", &user.username);
-        ctx.insert("error", "no_content");
-        return render_with(&state, jar, "article.html", ctx);
-    }
-
-    tracing::info!(
-        "article: {}→{} {} chars, 开始拆句",
-        source_lang, target_lang, file_content.chars().count()
-    );
-
-    // 先落一条"拆分中"的占位记录，请求立即返回，拆句在后台做
-    let placeholder = ArticleSegment::serialize_all(&[]);
-    let save_result = sqlx::query(
+    // 先落一条 "splitting" 占位记录：拆句要跑 AI，请求必须立刻返回
+    let placeholder = serde_json::to_string(&json!({ "kind": "article", "segments": [] })).unwrap_or_default();
+    let inserted = sqlx::query(
         "INSERT INTO translations (user_id, filename, source_text, translated_text, source_lang, target_lang, status) \
-         VALUES (?, ?, ?, ?, ?, ?, 'splitting')"
+         VALUES (?, ?, ?, ?, ?, ?, 'splitting')",
     )
     .bind(user.id)
     .bind(&filename)
-    .bind(&file_content)
+    .bind(&content)
     .bind(&placeholder)
     .bind(&source_lang)
     .bind(&target_lang)
     .execute(&state.pool)
     .await;
 
-    let id = match save_result {
+    let id = match inserted {
         Ok(r) => r.last_insert_rowid(),
-        Err(e) => {
-            tracing::error!("保存文章记录失败: {}", e);
-            return article_error(&state, jar, &user.username, "保存失败");
-        }
+        Err(e) => return internal(e),
     };
+
+    tracing::info!("article: {}→{} {} chars, 开始拆句 id={}", source_lang, target_lang, content.chars().count(), id);
 
     let pool = state.pool.clone();
     let key = api_key.clone();
     let sl = source_lang.clone();
     let tl = target_lang.clone();
-    let prompt = custom_prompt.clone();
-    let raw_text = file_content.clone();
+
     tokio::spawn(async move {
-        // 1) 拆句 + 2) 校验
-        let segments = match build_segments(&key, &raw_text, &sl).await {
-            Ok(segs) => segs,
+        let segments = match build_segments(&key, &content, &sl).await {
+            Ok(segments) => segments,
             Err(e) => {
                 tracing::error!("文章拆句失败 id={}: {}", id, e);
                 translator::set_status(&pool, id, "failed").await;
@@ -560,17 +556,14 @@ async fn article_handler(
         };
         tracing::info!("article: 拆成 {} 句 id={}", segments.len(), id);
 
-        // 3) 落库片段，进入翻译阶段
         translator::replace_doc::<ArticleSegment>(&pool, id, &segments).await;
         translator::set_status(&pool, id, "running").await;
 
         let total = segments.len();
-        let (segs, result) = translator::translate_article_owned(
-            key, segments, sl, tl, prompt, pool.clone(), id,
-        ).await;
+        let (segments, result) = translator::translate_article_owned(key, segments, sl, tl, prompt, pool.clone(), id).await;
         match result {
             Ok(()) => {
-                let done = segs.iter().filter(|s| s.translation.is_some()).count();
+                let done = progress_done(&segments);
                 translator::set_status(&pool, id, "done").await;
                 tracing::info!("bg article translate done: {}/{} id={}", done, total, id);
             }
@@ -581,10 +574,9 @@ async fn article_handler(
         }
     });
 
-    ok(jar, Redirect::to(&format!("/result/{}", id)))
+    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
 }
 
-/// 拆句 + 校验 + 组装片段（后台任务里跑）。
 async fn build_segments(api_key: &str, text: &str, source_lang: &str) -> anyhow::Result<Vec<ArticleSegment>> {
     let sentences = translator::split_article(api_key, text, source_lang).await?;
     if sentences.is_empty() {
@@ -606,214 +598,82 @@ async fn build_segments(api_key: &str, text: &str, source_lang: &str) -> anyhow:
         .collect())
 }
 
-fn article_error(state: &Arc<AppState>, jar: Jar, username: &str, msg: &str) -> Response {
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", username);
-    ctx.insert("error", msg);
-    render_with(state, jar, "article.html", ctx)
-}
-
-async fn result_page(
+async fn put_edits(
     State(state): State<Arc<AppState>>,
     jar: Jar,
     Path(id): Path<i64>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Json(data): Json<Value>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
 
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    )
-    .bind(id)
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    let translation = match translation {
-        Ok(Some(t)) => t,
-        _ => return ok(jar, Redirect::to("/")),
+    let record = match fetch_record(&state, user.id, id).await {
+        Some(record) => record,
+        None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
-
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    ctx.insert("translation", &translation);
-    ctx.insert("note_error", &params.contains_key("note_error"));
-    ctx.insert("status", &translation.status);
-    ctx.insert("busy", &params.contains_key("busy"));
-
-    // 按 JSON 形态判定类型，不看文件扩展名
-    match translator::parse_content(&translation.translated_text) {
-        None => {
-            // 旧版本数据（纯文本文章/旧数组），给出提示而不是 500
-            ctx.insert("legacy", &true);
-            ctx.insert("is_subtitle", &false);
-            ctx.insert("is_article", &false);
-        }
-        Some(translator::ParsedContent::Subtitles(entries)) => {
-            let (total, done) = progress_counts(&entries);
-            ctx.insert("is_subtitle", &true);
-            ctx.insert("is_article", &false);
-            ctx.insert("total_entries", &total);
-            ctx.insert("done_entries", &done);
-            ctx.insert("unmatched", &(total - done));
-            ctx.insert("unmatched_text", &format!("{} entries remaining", total - done));
-            ctx.insert("entries", &entries);
-        }
-        Some(translator::ParsedContent::Article(segments)) => {
-            let (total, done) = progress_counts(&segments);
-            ctx.insert("is_subtitle", &false);
-            ctx.insert("is_article", &true);
-            ctx.insert("total_entries", &total);
-            ctx.insert("done_entries", &done);
-            ctx.insert("unmatched", &(total - done));
-            ctx.insert("unmatched_text", &format!("{} sentences remaining", total - done));
-            ctx.insert("entries", &segments);
-        }
-    }
-
-    render_with(&state, jar, "result.html", ctx)
-}
-
-/// 统计"总条数 / 已翻译条数"，字幕和文章片段通用。
-fn progress_counts<T: translator::Segment>(items: &[T]) -> (usize, usize) {
-    let done = items
-        .iter()
-        .filter(|e| e.translation().is_some_and(|t| !t.is_empty()))
-        .count();
-    (items.len(), done)
-}
-
-async fn continue_translate_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Path(id): Path<i64>,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u, None => return ok(jar, Redirect::to("/login")),
-    };
-    let api_key = get_api_key(&user, &state);
-    if api_key.is_empty() { return ok(jar, Redirect::to("/settings?error=no_api_key")); }
-
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    ).bind(id).bind(user.id).fetch_optional(&state.pool).await;
-
-    let translation = match translation { Ok(Some(t)) => t, _ => return ok(jar, Redirect::to("/")), };
-
-    if !translator::try_claim(&state.pool, id).await {
-        return ok(jar, Redirect::to(&format!("/result/{}?busy=1", id)));
-    }
-
-    let sl = &translation.source_lang;
-    let tl = &translation.target_lang;
-    let result = match translator::parse_content(&translation.translated_text) {
-        Some(translator::ParsedContent::Subtitles(mut entries)) => {
-            translator::continue_translate(&api_key, &mut entries, sl, tl, "", &state.pool, id).await
-        }
-        Some(translator::ParsedContent::Article(mut segments)) => {
-            translator::continue_translate_article(&api_key, &mut segments, sl, tl, "", &state.pool, id).await
-        }
-        None => Ok(()),
-    };
-    match result {
-        Ok(()) => translator::set_status(&state.pool, id, "done").await,
-        Err(e) => {
-            tracing::error!("continue translate failed: {} id={}", e, id);
-            translator::set_status(&state.pool, id, "failed").await;
-        }
-    }
-    ok(jar, Redirect::to(&format!("/result/{}", id)))
-}
-
-async fn edit_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Path(id): Path<i64>,
-    Json(data): Json<serde_json::Value>,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u, None => return ok(jar, Redirect::to("/login")),
-    };
-
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    ).bind(id).bind(user.id).fetch_optional(&state.pool).await;
-
-    let translation = match translation { Ok(Some(t)) => t, _ => return ok(jar, Redirect::to("/")), };
 
     let empty = serde_json::Map::new();
     let fields = data.as_object().unwrap_or(&empty);
 
-    // 前端发的是 { "0": "新译文", "1": "" }，下标即数组位置；空串表示清空
+    // key 是数组下标（0-based），空串表示清空
     let edits: Vec<(usize, Option<String>)> = fields
         .iter()
         .filter_map(|(key, value)| {
-            let idx = key.parse::<usize>().ok()?;
+            let index = key.parse::<usize>().ok()?;
             let text = value.as_str()?.trim().to_string();
-            Some((idx, if text.is_empty() { None } else { Some(text) }))
+            Some((index, if text.is_empty() { None } else { Some(text) }))
         })
         .collect();
 
-    match translator::parse_content(&translation.translated_text) {
-        Some(translator::ParsedContent::Subtitles(_)) => {
-            translator::merge_edits::<SubtitleEntry>(&state.pool, id, &edits).await
+    match translator::parse_content(&record.translated_text) {
+        Some(ParsedContent::Subtitles(_)) => {
+            translator::merge_edits::<SubtitleEntry>(&state.pool, id, &edits).await;
         }
-        Some(translator::ParsedContent::Article(_)) => {
-            translator::merge_edits::<ArticleSegment>(&state.pool, id, &edits).await
+        Some(ParsedContent::Article(_)) => {
+            translator::merge_edits::<ArticleSegment>(&state.pool, id, &edits).await;
         }
-        None => {}
+        None => return api_error(StatusCode::CONFLICT, "legacy_format"),
     }
 
-    ok(jar, Redirect::to(&format!("/result/{}", id)))
+    StatusCode::NO_CONTENT.into_response()
 }
 
-async fn annotate_handler(
+async fn annotate(
     State(state): State<Arc<AppState>>,
     jar: Jar,
     Path(id): Path<i64>,
-    Form(form): Form<AnnotateForm>,
+    Json(form): Json<AnnotateForm>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
     };
 
     let api_key = get_api_key(&user, &state);
     if api_key.is_empty() {
-        return ok(jar, Redirect::to("/settings?error=no_api_key"));
+        return api_error(StatusCode::BAD_REQUEST, "no_api_key");
     }
 
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    )
-    .bind(id)
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    let translation = match translation {
-        Ok(Some(t)) => t,
-        _ => return ok(jar, Redirect::to("/")),
-    };
-
-    // 字幕和文章都支持注释
-    let content = match translator::parse_content(&translation.translated_text) {
-        Some(c) => c,
-        None => return ok(jar, Redirect::to(&format!("/result/{}", id))),
-    };
-
-    let topic = form.topic.unwrap_or_default();
-    let note_lang = form.note_lang.unwrap_or_else(|| String::from("zh"));
-
+    let topic = form.topic.unwrap_or_default().trim().to_string();
     if topic.is_empty() {
-        return ok(jar, Redirect::to(&format!("/result/{}", id)));
+        return api_error(StatusCode::BAD_REQUEST, "empty_topic");
     }
+    let note_lang = form.note_lang.unwrap_or_else(|| "zh".to_string());
+
+    let record = match fetch_record(&state, user.id, id).await {
+        Some(record) => record,
+        None => return api_error(StatusCode::NOT_FOUND, "not_found"),
+    };
+
+    let content = match translator::parse_content(&record.translated_text) {
+        Some(content) => content,
+        None => return api_error(StatusCode::CONFLICT, "legacy_format"),
+    };
 
     if !translator::try_claim(&state.pool, id).await {
-        return ok(jar, Redirect::to(&format!("/result/{}?busy=1", id)));
+        return api_error(StatusCode::CONFLICT, "busy");
     }
 
     let lang_name = match note_lang.as_str() {
@@ -824,73 +684,186 @@ async fn annotate_handler(
     let prompt = format!("{} (respond in {})", topic, lang_name);
 
     let pool = state.pool.clone();
-    let api_key_clone = api_key.clone();
-
+    let key = api_key.clone();
     match content {
-        translator::ParsedContent::Subtitles(entries) => {
+        ParsedContent::Subtitles(entries) => {
             tokio::spawn(async move {
-                let (_, result) = translator::generate_annotations_owned::<SubtitleEntry>(
-                    api_key_clone, entries, prompt, pool.clone(), id,
-                ).await;
+                let (_, result) = translator::generate_annotations_owned::<SubtitleEntry>(key, entries, prompt, pool.clone(), id).await;
                 finish_job(&pool, id, result).await;
             });
         }
-        translator::ParsedContent::Article(segments) => {
+        ParsedContent::Article(segments) => {
             tokio::spawn(async move {
-                let (_, result) = translator::generate_annotations_owned::<ArticleSegment>(
-                    api_key_clone, segments, prompt, pool.clone(), id,
-                ).await;
+                let (_, result) = translator::generate_annotations_owned::<ArticleSegment>(key, segments, prompt, pool.clone(), id).await;
                 finish_job(&pool, id, result).await;
             });
         }
     }
 
-    ok(jar, Redirect::to(&format!("/result/{}", id)))
+    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
 }
 
-/// 后台任务结束时落状态。
-async fn finish_job(pool: &sqlx::SqlitePool, id: i64, result: anyhow::Result<()>) {
-    match result {
-        Ok(()) => translator::set_status(pool, id, "done").await,
-        Err(e) => {
-            tracing::error!("bg job failed: {} id={}", e, id);
-            translator::set_status(pool, id, "failed").await;
+async fn continue_translation(State(state): State<Arc<AppState>>, jar: Jar, Path(id): Path<i64>) -> Response {
+    let user = match require_user(&jar, &state).await {
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
+    };
+
+    let api_key = get_api_key(&user, &state);
+    if api_key.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "no_api_key");
+    }
+
+    let record = match fetch_record(&state, user.id, id).await {
+        Some(record) => record,
+        None => return api_error(StatusCode::NOT_FOUND, "not_found"),
+    };
+
+    if !translator::try_claim(&state.pool, id).await {
+        return api_error(StatusCode::CONFLICT, "busy");
+    }
+
+    let pool = state.pool.clone();
+    let sl = record.source_lang.clone();
+    let tl = record.target_lang.clone();
+
+    match translator::parse_content(&record.translated_text) {
+        Some(ParsedContent::Subtitles(mut entries)) => {
+            tokio::spawn(async move {
+                let result = translator::continue_translate(&api_key, &mut entries, &sl, &tl, "", &pool, id).await;
+                match result {
+                    Ok(()) => translator::set_status(&pool, id, "done").await,
+                    Err(e) => {
+                        tracing::error!("continue failed: {} id={}", e, id);
+                        translator::set_status(&pool, id, "failed").await;
+                    }
+                }
+            });
         }
+        Some(ParsedContent::Article(mut segments)) => {
+            tokio::spawn(async move {
+                let result = translator::continue_translate_article(&api_key, &mut segments, &sl, &tl, "", &pool, id).await;
+                match result {
+                    Ok(()) => translator::set_status(&pool, id, "done").await,
+                    Err(e) => {
+                        tracing::error!("continue failed: {} id={}", e, id);
+                        translator::set_status(&pool, id, "failed").await;
+                    }
+                }
+            });
+        }
+        None => {
+            translator::set_status(&state.pool, id, "done").await;
+            return api_error(StatusCode::CONFLICT, "legacy_format");
+        }
+    }
+
+    (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response()
+}
+
+/* ------------------------------------------------------------------ */
+/* 设置 / 语言                                                         */
+/* ------------------------------------------------------------------ */
+
+async fn settings_get(State(state): State<Arc<AppState>>, jar: Jar) -> Response {
+    let user = match require_user(&jar, &state).await {
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
+    };
+    let key = get_api_key(&user, &state);
+    Json(json!({
+        "has_key": !key.is_empty(),
+        "masked_key": mask_key(&key),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ApiKeyBody {
+    api_key: String,
+}
+
+async fn settings_put(State(state): State<Arc<AppState>>, jar: Jar, Json(body): Json<ApiKeyBody>) -> Response {
+    let user = match require_user(&jar, &state).await {
+        Ok(u) => u,
+        Err(err) => return err.into_response(),
+    };
+
+    let key = body.api_key.trim();
+    // 空值表示不允许清空（否则会静默回落到全局 Key，容易误解）
+    if key.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "empty_key");
+    }
+
+    if let Err(e) = sqlx::query("UPDATE users SET api_key = ? WHERE id = ?")
+        .bind(key)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await
+    {
+        return internal(e);
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct LangBody {
+    lang: String,
+}
+
+async fn set_lang(jar: Jar, Json(body): Json<LangBody>) -> Response {
+    if !crate::i18n::is_supported(&body.lang) {
+        return api_error(StatusCode::BAD_REQUEST, "unsupported_lang");
+    }
+    // 后端的 CSV 表头跟着 lang cookie 走，所以这一条必须落到 Cookie 上
+    let cookie = Cookie::build(("lang", body.lang))
+        .path("/")
+        .same_site(SameSite::Lax)
+        .max_age(time::Duration::days(365))
+        .build();
+    (jar.add(cookie), StatusCode::NO_CONTENT).into_response()
+}
+
+/* ------------------------------------------------------------------ */
+/* 下载                                                                */
+/* ------------------------------------------------------------------ */
+
+fn current_lang(jar: &Jar) -> String {
+    let raw = jar
+        .get("lang")
+        .map(|c| c.value().to_string())
+        .unwrap_or_else(|| crate::i18n::DEFAULT_LANG.to_string());
+    if crate::i18n::is_supported(&raw) {
+        raw
+    } else {
+        crate::i18n::DEFAULT_LANG.to_string()
     }
 }
 
-async fn download_handler(
+async fn download(
     State(state): State<Arc<AppState>>,
     jar: Jar,
     Path((id, format)): Path<(i64, String)>,
 ) -> Response {
     let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
+        Ok(u) => u,
+        Err(_) => return api_error(StatusCode::UNAUTHORIZED, "unauthorized"),
     };
 
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    )
-    .bind(id)
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    let translation = match translation {
-        Ok(Some(t)) => t,
-        _ => return ok(jar, Redirect::to("/")),
+    let record = match fetch_record(&state, user.id, id).await {
+        Some(record) => record,
+        None => return api_error(StatusCode::NOT_FOUND, "not_found"),
     };
 
-    // 格式白名单按内容类型区分：format 会进入文件名，不能任意拼
     let format = format.to_ascii_lowercase();
-    let base = strip_known_ext(&translation.filename);
+    let base = strip_known_ext(&record.filename);
     let base = if base.trim().is_empty() { "translation" } else { base };
 
-    let (content, ext, mime, prefix) = match translator::parse_content(&translation.translated_text) {
-        Some(translator::ParsedContent::Subtitles(entries)) => {
+    let (content, ext, mime, prefix) = match translator::parse_content(&record.translated_text) {
+        Some(ParsedContent::Subtitles(entries)) => {
             if !matches!(format.as_str(), "vtt" | "srt" | "txt") {
-                return ok(jar, (StatusCode::BAD_REQUEST, "subtitle supports vtt/srt/txt").into_response());
+                return api_error(StatusCode::BAD_REQUEST, "unsupported_format");
             }
             let mime = if format == "vtt" {
                 "text/vtt; charset=utf-8"
@@ -904,7 +877,7 @@ async fn download_handler(
                 "translated",
             )
         }
-        Some(translator::ParsedContent::Article(segments)) => match format.as_str() {
+        Some(ParsedContent::Article(segments)) => match format.as_str() {
             "txt" => (
                 translator::format_segments(&segments),
                 "txt".to_string(),
@@ -932,55 +905,81 @@ async fn download_handler(
                     "bilingual",
                 )
             }
-            _ => {
-                return ok(
-                    jar,
-                    (StatusCode::BAD_REQUEST, "article supports txt/src/csv").into_response(),
-                )
-            }
+            _ => return api_error(StatusCode::BAD_REQUEST, "unsupported_format"),
         },
-        None => return ok(jar, (StatusCode::GONE, "record format is no longer supported").into_response()),
+        None => return api_error(StatusCode::GONE, "legacy_format"),
     };
 
     let download_name = format!("{}_{}.{}", prefix, base, ext);
-
-    let mut response = Response::new(Body::from(content));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(mime),
-    );
+    let mut response = Response::new(axum::body::Body::from(content));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     response
         .headers_mut()
         .insert(header::CONTENT_DISPOSITION, content_disposition(&download_name));
-    ok(jar, response)
+    response
 }
 
-/// 去掉已知的字幕/文本扩展名（大小写不敏感，且只去一次）。
+/* ------------------------------------------------------------------ */
+/* SPA 回退                                                            */
+/* ------------------------------------------------------------------ */
+
+async fn api_not_found() -> Response {
+    api_error(StatusCode::NOT_FOUND, "not_found")
+}
+
+/// 非 `/api`、非静态文件的 GET 一律交给前端路由。
+/// 带扩展名的路径（比如 /assets/x.js）返回 404，避免把 HTML 当成 JS 发出去。
+async fn spa_index(uri: Uri) -> Response {
+    let path = uri.path();
+    let last = path.rsplit('/').next().unwrap_or("");
+    if last.contains('.') {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    match tokio::fs::read("static/index.html").await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("读取 static/index.html 失败: {}（先跑一次前端构建？）", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "前端资源缺失：请在 frontend/ 执行 npm run build",
+            )
+                .into_response()
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 文件名 / Header 工具                                                */
+/* ------------------------------------------------------------------ */
+
 fn strip_known_ext(name: &str) -> &str {
     let lower = name.to_ascii_lowercase();
     for ext in [".vtt", ".srt", ".txt"] {
-        if lower.ends_with(ext) {
+        if lower.ends_with(ext) && name.len() > ext.len() {
             return &name[..name.len() - ext.len()];
         }
     }
     name
 }
 
-/// 生成 Content-Disposition。
-///
-/// filename 来自用户上传的文件名，可能含中文、引号甚至控制字符：
-/// - ASCII 回退名只保留安全字符，保证 header 一定合法（避免 `HeaderValue::from_str` 失败 panic）
-/// - 原名按 RFC 5987 用 filename* 传递，中文名才能正确落盘
 fn content_disposition(filename: &str) -> HeaderValue {
     let ascii = ascii_fallback_name(filename);
+    let encoded = pct_encode(filename);
     let value = format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-        ascii,
-        pct_encode(filename)
+        ascii, encoded
     );
     HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
+/// 非 ASCII / 控制字符统一替换成 `_`，保证 header 合法。
 fn ascii_fallback_name(name: &str) -> String {
     let mut out: String = name
         .chars()
@@ -1003,111 +1002,14 @@ fn ascii_fallback_name(name: &str) -> String {
 }
 
 fn pct_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
     out
-}
-
-async fn history_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
-    };
-
-    let translations = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE user_id = ? ORDER BY created_at DESC LIMIT 50"
-    )
-    .bind(user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    ctx.insert("translations", &translations);
-
-    render_with(&state, jar, "history.html", ctx)
-}
-
-async fn settings_page(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
-    };
-
-    let mut ctx = tera::Context::new();
-    ctx.insert("username", &user.username);
-    let api_key = get_api_key(&user, &state);
-    ctx.insert("api_key", &api_key);
-    ctx.insert("api_key_masked", &mask_key(&api_key));
-    ctx.insert("updated", &false);
-
-    render_with(&state, jar, "settings.html", ctx)
-}
-
-async fn settings_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Form(form): Form<ApiKeyForm>,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return ok(jar, Redirect::to("/login")),
-    };
-
-    let _ = sqlx::query("UPDATE users SET api_key = ? WHERE id = ?")
-        .bind(&form.api_key)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await;
-
-    ok(jar, Redirect::to("/settings?updated=1"))
-}
-
-async fn status_handler(
-    State(state): State<Arc<AppState>>,
-    jar: Jar,
-    Path(id): Path<i64>,
-) -> Response {
-    let user = match require_user(&jar, &state).await {
-        Some(u) => u,
-        None => return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response(),
-    };
-
-    let translation = sqlx::query_as::<_, Translation>(
-        "SELECT * FROM translations WHERE id = ? AND user_id = ?"
-    )
-    .bind(id)
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    match translation {
-        Ok(Some(t)) => match translator::parse_content(&t.translated_text) {
-            Some(translator::ParsedContent::Subtitles(entries)) => {
-                let (total, done) = progress_counts(&entries);
-                Json(serde_json::json!({ "total": total, "done": done, "status": t.status, "entries": entries })).into_response()
-            }
-            Some(translator::ParsedContent::Article(segments)) => {
-                let (total, done) = progress_counts(&segments);
-                Json(serde_json::json!({ "total": total, "done": done, "status": t.status, "entries": segments })).into_response()
-            }
-            None => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "unparsable", "status": t.status}))).into_response(),
-        },
-        _ => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
-    }
 }
 
 fn mask_key(key: &str) -> String {
@@ -1127,7 +1029,6 @@ mod tests {
 
     #[test]
     fn content_disposition_is_always_valid_header() {
-        // 以前 CRLF 会让 HeaderValue::from_str 失败，unwrap 直接 panic
         for name in [
             "translated_a.vtt",
             "translated_英文字幕.txt",
@@ -1145,9 +1046,11 @@ mod tests {
 
     #[test]
     fn content_disposition_encodes_non_ascii() {
-        let s = content_disposition("translated_英文字幕.txt").to_str().unwrap().to_string();
+        let s = content_disposition("translated_英文字幕.txt")
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(s.contains("filename*=UTF-8''"), "{s}");
-        // 中文应被百分号编码，而不是原样塞进 header
         assert!(!s.contains('英'), "{s}");
     }
 
@@ -1180,7 +1083,28 @@ mod tests {
     fn mask_key_handles_utf8() {
         assert_eq!(mask_key("short"), "****");
         assert_eq!(mask_key("sk-1234567890"), "sk-1****7890");
-        // 修复前这里会 panic（切在第 4 个字节中间）
         assert_eq!(mask_key("密钥密钥密钥密钥密钥"), "密钥密钥****密钥密钥");
+    }
+
+    #[test]
+    fn record_json_marks_legacy_format() {
+        let record = Translation {
+            id: 1,
+            user_id: 1,
+            filename: "old.txt".into(),
+            source_text: "x".into(),
+            translated_text: "just plain text".into(),
+            source_lang: "en".into(),
+            target_lang: "zh".into(),
+            status: "done".into(),
+            created_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(10, 30, 0)
+                .unwrap(),
+        };
+        let body = record_json(&record, false);
+        assert_eq!(body["kind"], "legacy");
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["created_at"], "2026-01-01 10:30");
     }
 }

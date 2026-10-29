@@ -8,9 +8,9 @@ mod session;
 mod translator;
 
 use std::sync::Arc;
+
 use anyhow::Result;
-use axum::Router;
-use tower_http::services::ServeDir;
+use axum::{middleware, Router};
 
 use crate::config::Config;
 use crate::db::create_pool;
@@ -23,22 +23,21 @@ async fn main() -> Result<()> {
 
     if let Some(log_file) = &config.log_file {
         let file = std::fs::OpenOptions::new()
-            .create(true).append(true).open(log_file)?;
+            .create(true)
+            .append(true)
+            .open(log_file)?;
         tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))
             .init();
     } else {
         tracing_subscriber::fmt::init();
     }
+
     let pool = create_pool(&config.database_url).await?;
-
     db::run_migrations(&pool).await?;
-
-    let tera = tera::Tera::new("templates/**/*.html")?;
 
     let state = Arc::new(AppState {
         pool,
-        tera,
         default_api_key: config.default_api_key.clone(),
         session_secret: config.session_secret.clone(),
         cookie_secure: config.cookie_secure,
@@ -48,11 +47,9 @@ async fn main() -> Result<()> {
         tracing::warn!("No DEFAULT_API_KEY set — users must configure their own API key");
     }
 
-    let app = Router::new()
-        .merge(routes::router())
-        .nest_service("/static", ServeDir::new("static"))
-        // 无 lang Cookie 时按 Accept-Language 自动选语言
-        .layer(axum::middleware::from_fn(routes::detect_language))
+    // 前端产物在 static/ 下（frontend/ 构建而来），后端只提供 /api 与静态回退
+    let app: Router = routes::router()
+        .layer(middleware::from_fn(routes::origin_guard))
         .with_state(state);
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
