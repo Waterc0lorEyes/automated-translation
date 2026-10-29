@@ -62,12 +62,12 @@
 |---|---|
 | 语言 | Rust 2021（开发时 1.99.1） |
 | Web | Axum 0.8 + Tower HTTP |
-| 模板 | Tera（服务端渲染） |
+| 页面 | Vue Router 管理的前端路由，后端只做 SPA 回退 |
 | 数据库 | SQLite（sqlx，编译期不做查询校验） |
 | 密码 | Argon2 + password-hash |
 | 会话 | HMAC-SHA256 签名 Cookie（hmac + sha2） |
 | 外部服务 | DeepSeek Chat API（reqwest + rustls） |
-| 前端 | 原生 CSS/JS，无构建步骤 |
+| 前端 | Vue 3 + TypeScript + Vite 7 + Vue Router（SPA） |
 
 ---
 
@@ -91,23 +91,33 @@ DEFAULT_API_KEY=sk-你的key
 SESSION_SECRET=$(openssl rand -hex 32)
 ```
 
-### 3. 运行
+### 3. 构建前端
+
+```bash
+cd frontend
+npm ci
+npm run build      # 产物直接写进 ../static（index.html + assets/）
+```
+
+### 4. 运行
 
 ```bash
 cargo run
 # 访问 http://localhost:3000
 ```
 
-> **注意**：`templates/` 和 `static/` 是按相对路径加载的，必须在项目根目录启动。
+> **注意**：`static/` 是按相对路径加载的，必须在项目根目录启动。
+> 没有 API Key 时可以用 `node dev/mock-deepseek.mjs` 起一个假模型，见下文「开发模式」。
 
-### 4. 构建发布版
+### 5. 构建发布版
 
 ```bash
 cargo build --release
-# 产物：target/release/automated-translation（约 21MB）
+# 产物：target/release/automated-translation
 ```
 
-部署时把 **二进制 + templates/ + static/ + .env** 放到同一目录即可，数据库文件会自动创建。
+部署时把 **二进制 + static/ + .env** 放到同一目录即可（不再需要 templates/），
+数据库文件会自动创建。
 
 ---
 
@@ -133,22 +143,28 @@ cargo build --release
 
 ```
 automated-translation/
-├── src/
-│   ├── main.rs          # 启动、路由装配、中间件挂载
-│   ├── config.rs        # 环境变量解析
-│   ├── db.rs            # 连接池、建表、启动时重置中断任务
-│   ├── models.rs        # User / Translation / SubtitleEntry / ArticleSegment / 表单
-│   ├── parser.rs        # VTT/SRT 解析（保留定位信息与断行）
-│   ├── translator.rs    # DeepSeek 客户端、拆句、翻译、注释、导出格式化
-│   ├── routes.rs        # 全部 HTTP 处理器 + 语言检测中间件
-│   ├── session.rs       # 会话签名与 Cookie 属性
-│   └── i18n.rs          # 四语文案表 + Accept-Language 解析
-├── templates/           # Tera 模板（继承 base.html）
-├── static/
-│   ├── style.css        # 设计令牌 + 深色主题
-│   └── app.js           # Toast / 拖拽上传 / 提交态
+├── src/                      # Rust 后端
+│   ├── main.rs               # 启动、路由装配、中间件挂载
+│   ├── config.rs             # 环境变量解析
+│   ├── db.rs                 # 连接池、建表、启动时重置中断任务
+│   ├── models.rs             # User / Translation / SubtitleEntry / ArticleSegment
+│   ├── parser.rs             # VTT/SRT 解析（保留定位信息与断行）
+│   ├── translator.rs         # DeepSeek 客户端、拆句、翻译、注释、导出格式化
+│   ├── routes.rs             # /api JSON 接口 + 静态回退 + Origin 校验
+│   ├── session.rs            # 会话签名与 Cookie 属性
+│   └── i18n.rs               # 四语文案表（前端字典由它生成）
+├── frontend/                 # Vue 3 SPA
+│   ├── src/api/              # 类型 + http 适配层（+ 可选 mock）
+│   ├── src/views/            # 首页 / 上传 / 结果 / 历史 / 设置 / 登录 / 注册
+│   ├── src/components/       # 导航、表格、进度条、拖拽区、Toast…
+│   ├── src/composables/      # useAuth / usePolling / useToast
+│   ├── src/i18n/             # dict.ts 由 Rust 生成，禁止手改
+│   └── src/styles/           # 设计令牌 + 基础层（浅色磨砂）
+├── static/                   # 前端构建产物（npm run build 生成）
+├── dev/mock-deepseek.mjs     # 无 Key 时的本地 mock 模型
 ├── .env.example
-└── SKILL.md             # 给 AI 助手看的开发速查
+├── FRONTEND-CONTRACT.md      # 架构与 API 契约（改接口先看这里）
+└── SKILL.md                  # 给 AI 助手看的开发速查
 ```
 
 ---
@@ -251,23 +267,28 @@ status=done（异常则 failed）
 
 ## HTTP 接口
 
-| 方法 | 路径 | 说明 | 认证 |
-|---|---|---|---|
-| GET | `/` | 首页 + 最近翻译 | 需登录 |
-| GET/POST | `/login` | 登录 | 公开 |
-| GET/POST | `/register` | 注册 | 公开 |
-| GET | `/logout` | 退出 | 公开 |
-| GET/POST | `/subtitle` | 字幕上传与翻译 | 需登录 |
-| GET/POST | `/article` | 文章上传与翻译 | 需登录 |
-| GET | `/result/{id}` | 结果页（字幕表 / 逐句表） | 需登录 |
-| POST | `/edit/{id}` | 编辑译文（JSON：`{"0":"新译文","1":""}`，空串=清空） | 需登录 |
-| POST | `/continue-translate/{id}` | 补译未完成条目 | 需登录 |
-| POST | `/annotate/{id}` | 生成注释（`topic`、`note_lang`） | 需登录 |
-| GET | `/download/{id}/{format}` | 导出 | 需登录 |
-| GET | `/history` | 翻译历史（最近 50 条） | 需登录 |
-| GET/POST | `/settings` | 配置个人 API Key | 需登录 |
-| GET | `/api/status/{id}` | 进度（JSON：`total/done/status/entries`） | 需登录 |
-| GET | `/setlang/{lang}` | 切换语言，写 `lang` Cookie（一年） | 公开 |
+页面路由（`/`、`/login`、`/upload/*`、`/result/*` 等）由 Vue Router 接管，
+后端只负责回退 `static/index.html`。真正的接口如下，完整字段见
+[FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md)：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/auth/register` | 注册（成功后直接登录） |
+| POST | `/api/auth/login` | 登录 |
+| POST | `/api/auth/logout` | 退出 |
+| GET | `/api/me` | 当前用户 + Key 掩码 |
+| GET | `/api/translations` | 历史列表（最近 100 条，不含 entries） |
+| GET | `/api/translations/{id}` | 单条记录（含 entries） |
+| GET | `/api/translations/{id}/status` | 进度轮询 `total/done/status/entries` |
+| POST | `/api/translations` | 上传（multipart）并启动翻译 |
+| POST | `/api/translations/{id}/edits` | 编辑译文（`{"0":"译文","1":""}`，空串=清空） |
+| POST | `/api/translations/{id}/annotate` | 生成注释（`topic`、`note_lang`） |
+| POST | `/api/translations/{id}/continue` | 补译未完成条目 |
+| GET/PUT | `/api/settings` | 读取 / 保存个人 API Key |
+| POST | `/api/lang` | 切换语言，写 `lang` Cookie |
+| GET | `/download/{id}/{format}` | 导出（浏览器直接跳转） |
+
+所有写接口都会校验 `Origin`，跨站请求返回 403。
 
 ---
 
@@ -300,29 +321,37 @@ CSV 针对 Excel 做了处理：UTF-8 BOM、CRLF 换行、字段含逗号/引号
 
 四种语言：`zh` / `zh-TW`（台）/ `zh-HK`（港）/ `en`。
 
-语言来源优先级：
+语言来源优先级（前端 `src/i18n/index.ts`）：
 
-1. 用户手动选择（`lang` Cookie）
-2. 浏览器 `Accept-Language`（按 q 值排序；`zh-HK`/`zh-MO`/`zh-Hant-HK` → 香港，
-   `zh-TW`/`zh-Hant*` → 台湾，`zh-CN`/`zh` → 简体，`en*` → English）
+1. 用户手动选择（localStorage，同时 `POST /api/lang` 写 Cookie）
+2. 浏览器 `Accept-Language`（`zh-HK`/`zh-MO` → 香港，`zh-TW`/`zh-Hant*` → 台湾，
+   `zh-CN`/`zh` → 简体，`en*` → English）
 3. 默认简体
 
-浏览器检测在 `routes::detect_language` 中间件里完成：没有 `lang` Cookie 时把检测结果
-合成进请求的 Cookie 头，业务处理器无感知。
+后端只在导出 CSV 时用 `lang` Cookie 决定表头语言。
 
 港台用词做了区分（帳戶/帳號、用戶/使用者、註釋/註解、檔案名稱/檔名）。
 
-**新增文案**：在 `src/i18n.rs` 的 `get_translation()` 里加一条四元组
-`["简体", "繁體(台)", "繁體(港)", "English"]`，再把 key 加进 `routes.rs` 的 `t_ctx()`
-key 列表，模板里用 `{{ key }}`。
+**新增文案**：
+
+1. 在 `src/i18n.rs` 的 `get_translation()` 里加一条四元组
+   `["简体", "繁體(台)", "繁體(港)", "English"]`
+2. `cd frontend && npm run gen:i18n` 重新生成 `src/i18n/dict.ts`
+3. 页面里用 `t('key')`
+
+前端字典是生成物，**不要手改**；CI 里可以跑 `npm run gen:i18n && git diff --exit-code`。
 
 ---
 
 ## 测试
 
 ```bash
-cargo test        # 74 个单元测试
+cargo test        # 69 个单元测试
 cargo clippy      # 0 warning
+
+cd frontend
+npm run typecheck # 0 error
+npm test          # 10 个冒烟测试（happy-dom 挂载整个 SPA）
 ```
 
 覆盖的重点：
@@ -346,19 +375,20 @@ Ubuntu 24.04 / x86_64 / glibc 2.39，systemd 托管，nginx 反向代理到本�
 ### 首次部署
 
 ```bash
-# 本地构建
+# 本地构建：先前端，再后端
+cd frontend && npm ci && npm run build && cd ..
 cargo build --release
 
-# 上传（二进制 + 模板 + 静态资源，保留服务器上的 .env 和 data.db）
+# 上传（二进制 + 前端产物，保留服务器上的 .env 和 data.db）
 scp target/release/automated-translation user@host:~/automated-translation/
-tar czf - templates static | ssh user@host 'tar xzf - -C ~/automated-translation'
+tar czf - static | ssh user@host 'tar xzf - -C ~/automated-translation'
 ```
 
 服务器上：
 
 ```bash
 cd ~/automated-translation
-chmod 644 static/* templates/*
+chmod -R a+r static
 ```
 
 `.env` 生产配置示例：
@@ -422,7 +452,7 @@ location / {
 # 备份 → 停服 → 上传 → 启服
 ssh host 'cd ~ && tar czf ~/backups/app-$(date +%F-%H%M).tar.gz automated-translation/ && sudo systemctl stop automated-translation'
 scp target/release/automated-translation host:~/automated-translation/automated-translation.new
-tar czf - templates static | ssh host 'tar xzf - -C ~/automated-translation'
+tar czf - static | ssh host 'tar xzf - -C ~/automated-translation'
 ssh host 'cd ~/automated-translation && mv -f automated-translation.new automated-translation && sudo systemctl start automated-translation'
 ```
 

@@ -30,13 +30,16 @@ src/
 ├── models.rs        # 数据结构：User, Translation, SubtitleEntry, 各种表单
 ├── parser.rs        # VTT/SRT 字幕解析器（保留 align/line 定位信息）
 ├── translator.rs    # DeepSeek API 客户端 — 翻译、注释、补译、导出格式化
-├── routes.rs        # 全部 HTTP 处理器 (认证/字幕/文章/结果/编辑/注释/下载/历史/设置)
+├── routes.rs        # /api JSON 接口 + 静态回退 + Origin 校验
 ├── session.rs       # 会话签名（HMAC-SHA256）与 Cookie 属性
-├── i18n.rs          # 中英文翻译表，语言切换
-templates/           # Tera HTML 模板 (8个)
-static/style.css     # 样式
-.env                # DATABASE_URL, DEFAULT_API_KEY
+└── i18n.rs          # 四语文案表（前端字典由它生成）
+frontend/            # Vue 3 SPA（源码）
+static/              # 前端构建产物（npm run build 生成）
+dev/mock-deepseek.mjs# 无 API Key 时的本地 mock 模型
+.env                 # DATABASE_URL, DEFAULT_API_KEY
 ```
+
+后端**不再有模板**：所有页面由 Vue Router 管理，Rust 只在找不到静态文件时回退 index.html。
 
 ---
 
@@ -88,20 +91,22 @@ struct AnnotateForm { topic: Option<String>, note_lang: Option<String> }
 
 | 方法 | 路径 | 处理器 | 认证 |
 |------|------|--------|------|
-| GET | `/` | home | 需登录 |
-| GET/POST | `/login` | login_page / login_handler | 公开 |
-| GET/POST | `/register` | register_page / register_handler | 公开 |
-| GET | `/logout` | logout_handler | 无限制 |
-| GET/POST | `/subtitle` | subtitle_page / subtitle_handler | 需登录 |
-| GET/POST | `/article` | article_page / article_handler | 需登录 |
-| GET | `/result/{id}` | result_page | 需登录 |
-| POST | `/edit/{id}` | edit_handler (JSON body) | 需登录 |
-| POST | `/continue-translate/{id}` | continue_translate_handler | 需登录 |
-| POST | `/annotate/{id}` | annotate_handler (AnnotateForm) | 需登录 |
-| GET | `/download/{id}/{format}` | download_handler | 需登录 |
-| GET | `/history` | history_page | 需登录 |
-| GET/POST | `/settings` | settings_page / settings_handler | 需登录 |
-| GET | `/setlang/{lang}` | setlang_handler (设语言 Cookie) | 无限制 |
+| POST | `/api/auth/register` | register（自动登录） | 公开 |
+| POST | `/api/auth/login` | login | 公开 |
+| POST | `/api/auth/logout` | logout | 公开 |
+| GET | `/api/me` | me | 需登录 |
+| GET/POST | `/api/translations` | list_translations / create_translation | 需登录 |
+| GET | `/api/translations/{id}` | get_translation（含 entries） | 需登录 |
+| GET | `/api/translations/{id}/status` | get_status（轮询） | 需登录 |
+| POST | `/api/translations/{id}/edits` | put_edits（JSON 下标） | 需登录 |
+| POST | `/api/translations/{id}/annotate` | annotate | 需登录 |
+| POST | `/api/translations/{id}/continue` | continue_translation | 需登录 |
+| GET/PUT | `/api/settings` | settings_get / settings_put | 需登录 |
+| POST | `/api/lang` | set_lang（写 Cookie） | 公开 |
+| GET | `/download/{id}/{format}` | download | 需登录 |
+| GET | 其余路径 | ServeDir → 回退 index.html | 公开 |
+
+完整字段与错误码见 `FRONTEND-CONTRACT.md`。
 
 ---
 
@@ -216,24 +221,17 @@ SRT: 数字编号，时间戳 `,` 转 `.`。
 
 支持四种语言：`zh`（简体）/ `zh-TW`（台湾繁体）/ `zh-HK`（香港繁体）/ `en`。
 
-- `I18n::new(code)` 内部映射成 `Lang`，`I18n::t(key)` 返回对应语言文案
-- 文案表是 `["简体", "繁體(台)", "繁體(港)", "English"][idx]` 四元组
-- **语言来源优先级**：`lang` Cookie（用户主动选择）> 浏览器 `Accept-Language` > 默认 `zh`
-- 浏览器检测在 `routes::detect_language` 中间件里做：没有 lang Cookie 时按
-  `Accept-Language` 的 q 值挑一个，合成到请求 Cookie 头里，handler 无需感知
-  - `zh-HK` / `zh-MO` / `zh-Hant-HK` → 香港繁体（港优先于泛繁体）
-  - `zh-TW` / `zh-Hant*` → 台湾繁体；`zh-CN` / `zh-Hans` / `zh` → 简体
-  - 不支持的语言（如 `fr`）跳过，最终落回默认简体
-- `GET /setlang/{lang}` 只接受 `SUPPORTED` 里的代码，写 Cookie（有效期一年）；
-  非法值直接跳回首页不写 Cookie
-- 导航栏用的是四选一下拉（未登录页面也可见），`<html lang>` 输出当前语言代码
+- 文案表仍然是 Rust 的 `i18n.rs`（四元组），**前端字典由它生成**：
+  `cd frontend && npm run gen:i18n` → `frontend/src/i18n/dict.ts`
+- 语言检测在前端 `src/i18n/index.ts`：localStorage（手动选择）> `Accept-Language` > 简体
+- 切换语言时前端同时 `POST /api/lang` 写 `lang` Cookie，后端导出 CSV 时用它决定表头
 - 港式用词与台湾不同：帳戶/帳號、用戶/使用者、註釋/註解、檔案名稱/檔名
-- `t_ctx(&i18n, &mut ctx)` 注入所有 key
+- 后端 `I18n` 现在只服务于 CSV 表头与 `/api/lang` 的白名单校验
 
 ### 新增翻译文本步骤
-1. `i18n.rs` 的 `get_translation()` 添加 key: `"key" => &["中文", "English"][idx]`
-2. `routes.rs` 的 `t_ctx()` 的 keys 数组加入该 key
-3. 模板中用 `{{ key }}`
+1. `i18n.rs` 的 `get_translation()` 添加四元组
+2. `cd frontend && npm run gen:i18n`
+3. 页面里 `t('key')`
 
 ---
 
@@ -254,42 +252,36 @@ SRT: 数字编号，时间戳 `,` 转 `.`。
 
 ## 前端
 
-静态资源只有两个文件，无构建步骤：
+Vue 3 + TypeScript + Vite，源码在 `frontend/`，构建产物在 `static/`。
 
-- `static/style.css`：设计令牌（CSS 变量）集中在 `:root`，深色霓虹主题。
-  改配色只动 token；`--accent` / `--accent-2` / `--accent-3` 组成渐变。
-  含 View Transitions、`prefers-reduced-motion` 降级、响应式断点 820/560px。
-- `static/app.js`：Toast（`window.toast(msg, type)`）、拖拽上传（`[data-drop]` 容器 +
-  内部 `input[type=file]`）、表单提交按钮 loading 态。
+- 入口：`src/main.ts` → `App.vue` → `layouts/AppLayout.vue` + `router.ts`
+- 页面：`views/`（Home / Login / Register / Upload / Result / History / Settings）
+- 组件：`components/`（AppNav、ResultTable、ProgressBar、DropZone、ToastHost…）
+- 组合式：`composables/`（useAuth、usePolling、useToast）
+- 样式：`styles/tokens.css`（调色板 + 结构令牌，浅色磨砂）+ `styles/base.css`
+- 接口层：`api/types.ts`（契约）、`api/http.ts`（fetch）、`api/mock.ts`（离线调试）
 
-改主题色只需替换 `:root` 里的 accent 三个变量；换风格（如亮色）改 `--bg/--surface/--text` 即可。
-
-## 模板
-
-全部继承 `base.html`。使用 `{{ i18n_key }}` 实现多语言。
-
-| 模板 | 用途 |
-|------|------|
-| base.html | 导航栏、语言切换、布局 |
-| index.html | 首页卡片入口 + 最近翻译 |
-| login.html | 登录表单 |
-| register.html | 注册表单 |
-| subtitle.html | 字幕上传：语种 + 文件 + 提示词 |
-| article.html | 文章上传 |
-| result.html | 结果对照表格 + 注释 + 编辑 + 进度条 + 下载 |
-| history.html | 翻译历史 |
-| settings.html | API Key 配置 |
+改视觉只动 `tokens.css`；组件里不允许出现硬编码颜色。
 
 ---
 
 ## 开发模式
 
-### 新增处理器
-1. `router()` 添加 `.route(...)`
-2. 签名: `async fn xxx(State(state): State<Arc<AppState>>, jar: Jar, ...) -> Response`
-3. 开头认证: `let user = require_user(&jar, &state.pool).await;`
-4. 渲染: `render_with(&state, jar, "模板.html", ctx)`
-5. 重定向: `ok(jar, Redirect::to("/path"))`
+### 新增 API
+1. `routes::router()` 的 `api` 路由表里加 `.route("/xxx", get(handler))`
+2. 签名：`async fn xxx(State(state): State<Arc<AppState>>, jar: Jar, ...) -> Response`
+3. 认证：`let user = match require_user(&jar, &state).await { Ok(u) => u, Err(e) => return e.into_response() };`
+4. 成功返回 `Json(json!({...}))`，失败用 `api_error(StatusCode::…, "code")`
+5. 前端：在 `api/types.ts` 加类型、`api/http.ts` 加方法、`api/mock.ts` 同步一份（跑测试用）
+
+### 前端开发
+```bash
+cd frontend
+npm run dev        # 5173，/api 已代理到 3000
+npm run typecheck
+npm test
+npm run build      # 写进 ../static
+```
 
 ### 上传到服务器
 始终用 `ssh-mcp_upload` 逐个文件上传，不要上传目录。改完本地文件确认逻辑正确再上传。
