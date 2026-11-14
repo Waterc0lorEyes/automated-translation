@@ -1,9 +1,13 @@
 # AI 字幕 & 文章翻译
 
 一个自托管的 AI 翻译站点：上传 VTT/SRT 字幕或文章，用 DeepSeek 翻译成目标语言，
-支持逐句对照、人工编辑、AI 注释和多格式导出。Rust + Axum 服务端渲染，单二进制部署。
+支持逐句对照、人工编辑、AI 注释和多格式导出。Rust + Axum 后端 + Vue 3 SPA 前端，单二进制部署。
 
 线上地址：<https://tomatocat.art>
+
+> 本仓库是**后端**（Rust/Axum，只提供 `/api` 与静态托管）。前端在独立仓库
+> [**automated-translation-web**](https://github.com/Waterc0lorEyes/automated-translation-web)，
+> 构建产物需要放进本仓库的 `static/`（见下「构建前端」）。
 
 ---
 
@@ -94,10 +98,13 @@ SESSION_SECRET=$(openssl rand -hex 32)
 
 ### 3. 构建前端
 
+前端在独立仓库里，把它 clone 到本仓库的 `frontend/` 下（`.gitignore` 已忽略这个目录）：
+
 ```bash
+git clone https://github.com/Waterc0lorEyes/automated-translation-web.git frontend
 cd frontend
 npm ci
-npm run build      # 产物直接写进 ../static（index.html + assets/）
+STATIC_DIR=../static npm run build   # 产物写进 ../static（index.html + assets/）
 ```
 
 ### 4. 运行
@@ -131,6 +138,8 @@ MOCK=1 ./dev/run-demo.sh              # http://0.0.0.0:18080
 ```bash
 cd frontend && npm install && npm run dev   # 5173，/api 已代理到 3000
 ```
+
+（前提是前端仓库已经 clone 到 `frontend/`，见上面「构建前端」。）
 
 ### 5. 构建发布版
 
@@ -176,14 +185,14 @@ automated-translation/
 │   ├── routes.rs             # /api JSON 接口 + 静态回退 + Origin 校验
 │   ├── session.rs            # 会话签名与 Cookie 属性
 │   └── i18n.rs               # 四语文案表（前端字典由它生成）
-├── frontend/                 # Vue 3 SPA
+├── frontend/                 # Vue 3 SPA（独立仓库，clone 到这里；.gitignore 已忽略）
 │   ├── src/api/              # 类型 + http 适配层（+ 可选 mock）
 │   ├── src/views/            # 首页 / 上传 / 结果 / 历史 / 设置 / 登录 / 注册
 │   ├── src/components/       # 导航、表格、进度条、拖拽区、Toast…
 │   ├── src/composables/      # useAuth / usePolling / useToast
 │   ├── src/i18n/             # dict.ts 由 Rust 生成，禁止手改
 │   └── src/styles/           # 设计令牌 + 基础层（浅色磨砂）
-├── static/                   # 前端构建产物（npm run build 生成）
+├── static/                   # 前端构建产物，不入库（构建方式见上文）
 ├── dev/mock-deepseek.mjs     # 无 Key 时的本地 mock 模型
 ├── .env.example
 ├── FRONTEND-CONTRACT.md      # 架构与 API 契约（改接口先看这里）
@@ -405,7 +414,7 @@ Ubuntu 24.04 / x86_64 / glibc 2.39，systemd 托管，nginx 反向代理到本�
 
 ```bash
 # 本地构建：先前端，再后端
-cd frontend && npm ci && npm run build && cd ..
+cd frontend && npm ci && STATIC_DIR=../static npm run build && cd ..
 cargo build --release
 
 # 上传（二进制 + 前端产物，保留服务器上的 .env 和 data.db）

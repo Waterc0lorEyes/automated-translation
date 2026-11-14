@@ -5,13 +5,10 @@
 *.db-wal
 *.log
 .env
-/frontend/node_modules
-/frontend/dist
-/data-spa.db
-/data-spa.db-shm
-/data-spa.db-wal
 
-# 非仓库内容（设计 demo、留档备份）
-/demo/node_modules
-/demo/dist
-/archive
+# 前端仓库 clone 到这里（见 README「构建前端」）
+/frontend
+
+# 前端构建产物，只保留目录占位
+/static/*
+!/static/.gitkeep

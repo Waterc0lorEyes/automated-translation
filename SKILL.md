@@ -1,6 +1,6 @@
 ---
 name: automated-translation
-description: AI 字幕文章翻译网站，Rust/Axum 技术栈。用于处理字幕翻译(VTT/SRT)、文章翻译、注释生成、多语言界面等功能的开发和修改。工作目录 ~/automated-translation，部署环境 Ubuntu 127.0.0.1。
+description: AI 字幕文章翻译网站，Rust/Axum 技术栈。用于处理字幕翻译(VTT/SRT)、文章翻译、注释生成、多语言界面等功能的开发和修改。工作目录 ~/automated-translation，部署环境 Ubuntu + nginx。
 ---
 
 # AI 字幕 & 文章翻译
@@ -41,25 +41,22 @@ dev/mock-deepseek.mjs# 无 API Key 时的本地 mock 模型
 
 后端**不再有模板**：所有页面由 Vue Router 管理，Rust 只在找不到静态文件时回退 index.html。
 
-### 本地目录布局
+### 两个仓库
 
-工作目录本身就是仓库根，`src/`、`frontend/`、`static/`、`dev/` 直接在这一层（2026-11 整理后的结构）：
+本仓库只有后端代码；页面在独立的前端仓库
+[automated-translation-web](https://github.com/Waterc0lorEyes/automated-translation-web)。
 
 ```
-~/automated-translation\      # = 仓库根，git 跟踪的是这里
-├── src/ frontend/ static/ dev/   # 见上
-├── demo/                         # 重构前的设计 demo（Vue + mock，独立 npm 工程，不进仓库）
-├── docs/shots/                   # 页面截图（验收留档）
-├── archive/                      # 旧版本与备份，不参与构建
-│   ├── legacy-tera-ssr-2026-07/  # SPA 重构之前的 Tera SSR 源码（根 src/static/templates 的旧副本）
-│   ├── backups/                  # pre-spa 的 tar.gz、整目录 zip、旧二进制
-│   └── manifest-before-2026-11-14.txt  # 整理前的完整文件清单
-└── data-spa.db                   # MOCK=1 跑 run-demo.sh 用的演示库
+automated-translation/      # 本仓库（后端）
+├── src/                    # Rust 后端（见上）
+├── dev/                    # mock 模型 + 一键启动脚本
+├── static/                 # 前端构建产物，不入库（只有 .gitkeep）
+└── frontend/               # 前端仓库 clone 到这里，已被 .gitignore 忽略
 ```
 
-- `demo/` 仍可独立跑：`cd demo && npm run dev`；它的 `npm run gen:i18n` 读 `../src/i18n.rs`。
-- `archive/` 里的东西**不要引用**，只是留档；恢复整棵旧目录用 `archive/backups/automated-translation-2026-11-14.zip`（解出来是整理前的 `automated-translation/` 双层结构）。
-- 根目录的 `英文字幕.vtt` / `bright_ideas_for_a_bright_future_en.vtt` 是示例素材，格式同上。
+- 联调：`git clone <web 仓库> frontend && cd frontend && npm ci && STATIC_DIR=../static npm run build`
+- 没有 `static/` 也能启动，只是页面 404，`/api` 正常。
+- 示例素材：根目录的 `英文字幕.vtt` / `bright_ideas_for_a_bright_future_en.vtt`。
 
 ---
 
