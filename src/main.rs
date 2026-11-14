@@ -10,6 +10,7 @@ mod translator;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::extract::DefaultBodyLimit;
 use axum::{middleware, Router};
 
 use crate::config::Config;
@@ -49,6 +50,8 @@ async fn main() -> Result<()> {
 
     // 前端产物在 static/ 下（frontend/ 构建而来），后端只提供 /api 与静态回退
     let app: Router = routes::router()
+        // 上传体积上限：与 DEPLOY.md 里 nginx 的 client_max_body_size 20m 保持一致
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .layer(middleware::from_fn(routes::origin_guard))
         .with_state(state);
 
