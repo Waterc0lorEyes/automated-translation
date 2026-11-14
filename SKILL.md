@@ -41,6 +41,26 @@ dev/mock-deepseek.mjs# 无 API Key 时的本地 mock 模型
 
 后端**不再有模板**：所有页面由 Vue Router 管理，Rust 只在找不到静态文件时回退 index.html。
 
+### 本地目录布局
+
+工作目录本身就是仓库根，`src/`、`frontend/`、`static/`、`dev/` 直接在这一层（2026-11 整理后的结构）：
+
+```
+~/automated-translation\      # = 仓库根，git 跟踪的是这里
+├── src/ frontend/ static/ dev/   # 见上
+├── demo/                         # 重构前的设计 demo（Vue + mock，独立 npm 工程，不进仓库）
+├── docs/shots/                   # 页面截图（验收留档）
+├── archive/                      # 旧版本与备份，不参与构建
+│   ├── legacy-tera-ssr-2026-07/  # SPA 重构之前的 Tera SSR 源码（根 src/static/templates 的旧副本）
+│   ├── backups/                  # pre-spa 的 tar.gz、整目录 zip、旧二进制
+│   └── manifest-before-2026-11-14.txt  # 整理前的完整文件清单
+└── data-spa.db                   # MOCK=1 跑 run-demo.sh 用的演示库
+```
+
+- `demo/` 仍可独立跑：`cd demo && npm run dev`；它的 `npm run gen:i18n` 读 `../src/i18n.rs`。
+- `archive/` 里的东西**不要引用**，只是留档；恢复整棵旧目录用 `archive/backups/automated-translation-2026-11-14.zip`（解出来是整理前的 `automated-translation/` 双层结构）。
+- 根目录的 `英文字幕.vtt` / `bright_ideas_for_a_bright_future_en.vtt` 是示例素材，格式同上。
+
 ---
 
 ## 数据库结构

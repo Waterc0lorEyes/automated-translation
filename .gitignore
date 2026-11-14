@@ -10,3 +10,8 @@
 /data-spa.db
 /data-spa.db-shm
 /data-spa.db-wal
+
+# 非仓库内容（设计 demo、留档备份）
+/demo/node_modules
+/demo/dist
+/archive
